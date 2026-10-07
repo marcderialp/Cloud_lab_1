@@ -64,6 +64,7 @@ services:
 
   grafana:
     build: ./stats/grafana
+    restart: on-failure  # exits if postgres isn't ready yet
     environment: &grafana-env
       GF_DATABASE_TYPE: postgres
       GF_DATABASE_HOST: db:5432
