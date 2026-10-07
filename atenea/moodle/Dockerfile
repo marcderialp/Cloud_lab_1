@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
        | tar -xz -C /var/www \
     && echo "max_input_vars=5000" > /usr/local/etc/php/conf.d/moodle.ini \
     && sed -i 's#/var/www/html#/var/www/moodle#' /etc/apache2/sites-available/000-default.conf \
+    && echo "ServerName localhost" > /etc/apache2/conf-enabled/servername.conf \
     && mkdir -p /var/moodledata && chown www-data /var/moodledata
 COPY config.php /var/www/moodle/config.php
 COPY entrypoint.sh /entrypoint.sh
