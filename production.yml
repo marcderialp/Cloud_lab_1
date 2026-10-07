@@ -1,0 +1,179 @@
+# Production on docker swarm:
+#   docker compose -f production.yml build && docker compose -f production.yml push
+#   docker stack deploy --with-registry-auth -c production.yml lab1
+# (export the variables of .env first: set -a; . ./.env; set +a)
+
+x-scalable: &scalable
+  replicas: 2
+  update_config: { order: start-first, failure_action: rollback }
+x-single: &single
+  replicas: 1
+x-on-db-node: &on-db-node
+  replicas: 1
+  placement: { constraints: [node.labels.db == true] }
+x-nfs: &nfs "addr=${NFS_SERVER},nfsvers=4,rw,hard"
+
+x-moodle: &moodle
+  image: ${REGISTRY}/lab1/moodle
+  environment: { MOODLE_URL: "https://lms.${DOMAIN}" }
+  secrets: [moodle_db_password, moodle_admin_password]
+  volumes: [moodledata:/var/moodledata]
+  networks: [proxy, atenea]
+
+services:
+  # ---------- basic ----------
+  frontend:
+    image: ${REGISTRY}/lab1/frontend
+    build: ./basic/frontend
+    environment: { DOMAIN: "${DOMAIN}", TLS: "true", NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates-prod }
+    ports: ["80:80", "443:443"]
+    volumes: [certs:/etc/letsencrypt:ro, acme:/var/www/acme:ro]
+    networks: [proxy]
+    deploy: *scalable
+
+  letsencrypt:
+    image: certbot/certbot:v2.11.0
+    entrypoint: >
+      sh -c 'sleep 60; while true; do
+      certbot certonly --webroot -w /var/www/acme --cert-name ${DOMAIN} --keep-until-expiring
+      -d app.${DOMAIN} -d lms.${DOMAIN} -d grafana.${DOMAIN} -d registry.${DOMAIN}
+      --email ${LE_EMAIL} --agree-tos -n; sleep 12h; done'
+    volumes: [certs:/etc/letsencrypt, acme:/var/www/acme]
+    deploy: *single
+
+  registry:
+    image: registry:2.8.3
+    environment:
+      REGISTRY_HTTP_SECRET: ${REGISTRY_HTTP_SECRET}
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: lab1
+      REGISTRY_AUTH_HTPASSWD_PATH: /run/secrets/registry_htpasswd
+    secrets: [registry_htpasswd]
+    ports: ["5000:5000"]
+    volumes: [registry:/var/lib/registry]
+    networks: [proxy]
+    deploy: *scalable
+
+  # ---------- app ----------
+  core:
+    image: ${REGISTRY}/lab1/core
+    build: ./app/core
+    environment: { DB_PASSWORD_FILE: /run/secrets/db_password, FEED_TOKEN_FILE: /run/secrets/feed_token, NOTIFY_EMAIL: "${NOTIFY_EMAIL}" }
+    secrets: [db_password, feed_token]
+    networks: [proxy, app]
+    deploy: { <<: *scalable, replicas: 3 }
+  static:
+    image: ${REGISTRY}/lab1/static
+    build: ./app/static
+    networks: [proxy]
+    deploy: *scalable
+  db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD_FILE: /run/secrets/db_password }
+    secrets: [db_password]
+    configs: [{ source: init_sql, target: /docker-entrypoint-initdb.d/init.sql }]
+    volumes: [db:/var/lib/postgresql/data]
+    networks: [app]
+    deploy: *on-db-node
+  redis:
+    image: redis:7.4-alpine
+    networks: [app]
+    deploy: *single
+  smtp:
+    image: ${REGISTRY}/lab1/smtp
+    build: ./app/smtp
+    environment: { RELAY_HOST: "${RELAY_HOST}", RELAY_PORT: "${RELAY_PORT}", RELAY_USER: "${RELAY_USER}", RELAY_PASSWORD: "${RELAY_PASSWORD}" }
+    networks: [app]
+    deploy: *scalable
+  auto:
+    image: ${REGISTRY}/lab1/auto
+    build: ./app/auto
+    environment: { FEED_TOKEN_FILE: /run/secrets/feed_token }
+    secrets: [feed_token]
+    networks: [app]
+    deploy: *single
+  backup:
+    image: ${REGISTRY}/lab1/backup
+    build: ./app/backup
+    secrets: [db_password, moodle_db_password]
+    volumes: [backups:/backups, moodledata:/moodledata:ro]
+    networks: [app, atenea]
+    deploy: *single
+
+  # ---------- atenea ----------
+  # only moodle builds the image; moodle-cron reuses it (building it twice fails)
+  moodle:
+    <<: *moodle
+    build: ./atenea/moodle
+    deploy: *scalable
+  moodle-cron:
+    <<: *moodle
+    command: sh -c 'while true; do su -s /bin/sh www-data -c "php admin/cli/cron.php"; sleep 60; done'
+    networks: [atenea]
+    deploy: *single
+  moodle-db:
+    image: mariadb:11.4
+    environment:
+      MARIADB_DATABASE: moodle
+      MARIADB_USER: moodle
+      MARIADB_PASSWORD_FILE: /run/secrets/moodle_db_password
+      MARIADB_RANDOM_ROOT_PASSWORD: "yes"
+    secrets: [moodle_db_password]
+    volumes: [moodle-db:/var/lib/mysql]
+    networks: [atenea]
+    deploy: *on-db-node
+
+  # ---------- stats ----------
+  grafana:
+    image: ${REGISTRY}/lab1/grafana
+    build: ./stats/grafana
+    environment:
+      GF_SERVER_ROOT_URL: https://grafana.${DOMAIN}
+      GF_DATABASE_TYPE: postgres
+      GF_DATABASE_HOST: db:5432
+      GF_DATABASE_NAME: grafana
+      GF_DATABASE_USER: app
+      GF_DATABASE_PASSWORD__FILE: /run/secrets/db_password
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+    secrets: [db_password, grafana_admin_password]
+    networks: [proxy, stats, app]
+    deploy: *scalable
+  prometheus:
+    image: ${REGISTRY}/lab1/prometheus
+    build: ./stats/prometheus
+    volumes: [prometheus:/prometheus]
+    networks: [stats, app]
+    deploy: *on-db-node
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    volumes: ["/:/rootfs:ro", "/var/run:/var/run:ro", "/sys:/sys:ro", "/var/lib/docker:/var/lib/docker:ro"]
+    networks: [stats]
+    deploy: { mode: global }
+
+networks:
+  proxy: { driver: overlay, driver_opts: { encrypted: "true" } }
+  app: { driver: overlay, driver_opts: { encrypted: "true" } }
+  atenea: { driver: overlay, driver_opts: { encrypted: "true" } }
+  stats: { driver: overlay }
+
+volumes:
+  # shared, on NFS
+  certs: { driver_opts: { type: nfs, o: *nfs, device: ":/letsencrypt" } }
+  acme: { driver_opts: { type: nfs, o: *nfs, device: ":/acme" } }
+  registry: { driver_opts: { type: nfs, o: *nfs, device: ":/registry" } }
+  moodledata: { driver_opts: { type: nfs, o: *nfs, device: ":/moodledata" } }
+  backups: { driver_opts: { type: nfs, o: *nfs, device: ":/backups" } }
+  # local disk of the db node
+  db: {}
+  moodle-db: {}
+  prometheus: {}
+
+configs:
+  init_sql: { file: ./app/init.sql }
+secrets:
+  db_password: { file: ./secrets/db_password }
+  moodle_db_password: { file: ./secrets/moodle_db_password }
+  moodle_admin_password: { file: ./secrets/moodle_admin_password }
+  grafana_admin_password: { file: ./secrets/grafana_admin_password }
+  feed_token: { file: ./secrets/feed_token }
+  registry_htpasswd: { file: ./secrets/registry_htpasswd }

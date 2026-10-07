@@ -1,0 +1,86 @@
+# Local environment: docker compose up -d --build
+# No TLS, no NFS, only named volumes. Open http://app.localhost:8080,
+# lms.localhost:8080, grafana.localhost:8080 and mail.localhost:8080 (mailpit)
+
+x-moodle: &moodle
+  image: lab1/moodle
+  environment: { MOODLE_URL: "http://lms.localhost:8080" }
+  secrets: [ moodle_db_password, moodle_admin_password ]
+  volumes: [ moodledata:/var/moodledata ]
+
+services:
+  frontend:
+    build: ./basic/frontend
+    environment: { DOMAIN: localhost, NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates-local }
+    ports: [ "8080:80" ]
+
+  core:
+    build: ./app/core
+    environment: { DB_PASSWORD_FILE: /run/secrets/db_password, FEED_TOKEN_FILE: /run/secrets/feed_token, NOTIFY_EMAIL: team@lab1.local }
+    secrets: [ db_password, feed_token ]
+  static:
+    build: ./app/static
+  db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD_FILE: /run/secrets/db_password }
+    secrets: [ db_password ]
+    configs: [ { source: init_sql, target: /docker-entrypoint-initdb.d/init.sql } ]
+    volumes: [ db:/var/lib/postgresql/data ]
+  redis:
+    image: redis:7.4-alpine
+  smtp:
+    build: ./app/smtp
+    environment: { RELAY_HOST: mailpit, RELAY_PORT: 1025, SMTP_TLS: none }
+  mailpit:
+    image: axllent/mailpit
+  auto:
+    build: ./app/auto
+    environment: { FEED_TOKEN_FILE: /run/secrets/feed_token, FEED_INTERVAL: 60 }
+    secrets: [ feed_token ]
+  backup:
+    build: ./app/backup
+    environment: { BACKUP_SCHEDULE: "0 * * * *" }
+    secrets: [ db_password, moodle_db_password ]
+    volumes: [ backups:/backups, moodledata:/moodledata:ro ]
+
+  # only moodle builds the image; moodle-cron reuses it (building it twice fails)
+  moodle:
+    <<: *moodle
+    build: ./atenea/moodle
+  moodle-cron:
+    <<: *moodle
+    pull_policy: never
+    depends_on: [moodle]
+    command: sh -c 'while true; do su -s /bin/sh www-data -c "php admin/cli/cron.php"; sleep 60; done'
+  moodle-db:
+    image: mariadb:11.4
+    environment:
+      MARIADB_DATABASE: moodle
+      MARIADB_USER: moodle
+      MARIADB_PASSWORD_FILE: /run/secrets/moodle_db_password
+      MARIADB_RANDOM_ROOT_PASSWORD: "yes"
+    secrets: [ moodle_db_password ]
+    volumes: [ moodle-db:/var/lib/mysql ]
+
+  grafana:
+    build: ./stats/grafana
+    environment: &grafana-env
+      GF_DATABASE_TYPE: postgres
+      GF_DATABASE_HOST: db:5432
+      GF_DATABASE_NAME: grafana
+      GF_DATABASE_USER: app
+      GF_DATABASE_PASSWORD__FILE: /run/secrets/db_password
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+    secrets: [ db_password, grafana_admin_password ]
+  prometheus:
+    build: ./stats/prometheus
+
+volumes: { db: {}, moodle-db: {}, moodledata: {}, backups: {} }
+configs:
+  init_sql: { file: ./app/init.sql }
+secrets:
+  db_password: { file: ./secrets/db_password }
+  moodle_db_password: { file: ./secrets/moodle_db_password }
+  moodle_admin_password: { file: ./secrets/moodle_admin_password }
+  grafana_admin_password: { file: ./secrets/grafana_admin_password }
+  feed_token: { file: ./secrets/feed_token }

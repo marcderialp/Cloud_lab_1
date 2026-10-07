@@ -1,0 +1,120 @@
+{
+  "uid": "lab1",
+  "title": "Lab1",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "CPU per service",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (container_label_com_docker_swarm_service_name) (rate(container_cpu_usage_seconds_total{container_label_com_docker_swarm_service_name!=\"\"}[5m]))",
+          "legendFormat": "{{container_label_com_docker_swarm_service_name}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Core requests per replica",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (rate(core_requests_total[5m]))",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Average rating",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "core-api"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "core-api"
+          },
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "http://core:8000/api/stats",
+          "columns": [
+            {
+              "selector": "average",
+              "text": "Average",
+              "type": "number"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Ratings captured by the feeder",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "core-api"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 8,
+        "w": 18,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "core-api"
+          },
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "http://core:8000/api/stats",
+          "root_selector": "external"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,278 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{booktabs,tabularx,enumitem,listings,xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\lstset{basicstyle=\ttfamily\small,backgroundcolor=\color{gray!8},frame=single,
+        rulecolor=\color{gray!40},breaklines=true,columns=fullflexible}
+\setlist{nosep}
+\newcommand{\svc}[1]{\texttt{#1}}
+
+\title{Laboratory 1: Short project\\[2pt]\large Docker, Compose and Swarm}
+\author{Member 1 \and Member 2 \and Member 3 \and Member 4 \and Member 5\\[4pt]
+\small Cloud Computing and Distributed Systems\\ MSc in Machine Learning and Cybersecurity for Internet Connected Systems, UPC}
+\date{October 2026}
+
+\sloppy
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+We containerised the infrastructure of Figure~1 of the statement: the shared services
+(\emph{basic}), a company application (\emph{app}), an observability platform
+(\emph{stats}) and Moodle (\emph{atenea}). As the core application we wrote a small review
+site in Flask: people leave a comment with a rating from 1 to 5, the average is cached in
+Redis, each new comment sends a mail through our SMTP relay and an automatic feeder
+collects ratings published in other web pages.
+
+The repository contains \texttt{compose.yml} (local), \texttt{production.yml} (swarm),
+one folder per image with its Dockerfile and files, and this document.
+
+\section{Architecture}
+
+Table~\ref{tab:services} maps the boxes of the diagram to our services. Each stack is an
+overlay network, and a service only joins the networks it needs. For example the
+databases are not in the \texttt{proxy} network, so the frontend can not reach them.
+
+\begin{table}[h]
+\centering\small
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+Stack & Service & Description \\
+\midrule
+basic  & \svc{frontend}    & nginx, the only public service (80/443), proxies by subdomain \\
+       & \svc{letsencrypt} & certbot, gets and renews one certificate for all subdomains \\
+       & \svc{registry}    & Docker registry with htpasswd authentication \\
+       & NFS               & NFSv4 server (port 2049), shared disk for the nodes \\
+\midrule
+app    & \svc{core}        & Flask + gunicorn application \\
+       & \svc{static}      & Apache serving \texttt{/static/} \\
+       & \svc{db}          & PostgreSQL 16 (databases \texttt{app} and \texttt{grafana}) \\
+       & \svc{redis}       & cache of the average rating \\
+       & \svc{smtp}        & Postfix relaying the mails to an external provider \\
+       & \svc{auto}        & feeder: reads schema.org ratings of web pages \\
+       & \svc{backup}      & cron that dumps the databases and moodledata \\
+\midrule
+atenea & \svc{moodle}, \svc{moodle-cron} & Moodle 4.5 LTS (web and cron, same image) \\
+       & \svc{moodle-db}   & MariaDB 11.4 \\
+\midrule
+stats  & \svc{grafana}     & dashboards, with the Infinity plugin (the ``?'') \\
+       & \svc{prometheus}, \svc{cadvisor} & metrics of the containers and the core app \\
+\bottomrule
+\end{tabularx}
+\caption{Services of the infrastructure.}
+\label{tab:services}
+\end{table}
+
+Public names in production: \texttt{app.<domain>}, \texttt{lms.<domain>},
+\texttt{grafana.<domain>} and \texttt{registry.<domain>}. Locally the same names are used
+with \texttt{localhost} on port 8080 (browsers resolve \texttt{*.localhost} to 127.0.0.1).
+
+\section{Images and design decisions}
+
+\paragraph{Frontend.} Based on \texttt{nginx:alpine}. We use the template feature of the
+official image (\texttt{envsubst} on startup) with two templates, local (http) and
+production (https), selected with \texttt{NGINX\_ENVSUBST\_TEMPLATE\_DIR}. Upstreams are
+resolved at request time through the Docker DNS, so nginx starts even if a backend is not
+running yet. nginx refuses to start without a certificate, so a small script creates a self
+signed one and switches to the Let's Encrypt one as soon as certbot gets it.
+
+\paragraph{Let's Encrypt.} The official certbot image with a loop: \texttt{certbot certonly
+--webroot --keep-until-expiring} every 12 hours, which issues the certificate the first time
+and renews it later. The challenge files are written in a volume shared with nginx.
+
+\paragraph{Core app.} Python 3.12 slim, runs as a non-root user. It creates its tables on
+the first request, so there is no separate migration step. It exposes \texttt{/metrics} for
+Prometheus (blocked from outside in nginx) and \texttt{/api/stats} with JSON for Grafana.
+The page includes the average rating as JSON-LD (schema.org), the same format online shops
+use for search engines.
+
+\paragraph{Auto.} The feeder downloads the pages in \texttt{FEED\_URLS}, extracts the
+\texttt{aggregateRating} of the JSON-LD and posts it to \texttt{/api/ratings}, protected by
+a bearer token. By default it reads our own app, but any page with that markup works.
+
+\paragraph{SMTP.} Postfix on Alpine. It only accepts mail from the Docker networks and
+relays it to the provider configured in \texttt{.env} with SASL authentication and
+mandatory TLS. In the local environment it relays to mailpit, so the mails can be checked in
+the browser.
+
+\paragraph{Moodle.} \texttt{php:8.3-apache} with the extensions Moodle needs and the 4.5 LTS
+release downloaded at build time. \texttt{config.php} reads the URL from the environment and
+the password from a Docker secret. The entrypoint waits for MariaDB and installs Moodle from
+the CLI the first time; to avoid two replicas installing at the same time, the one that
+manages to create a lock directory in the shared moodledata does it and the rest wait.
+\svc{moodle-cron} is the same image running \texttt{admin/cli/cron.php} every minute.
+
+\paragraph{Grafana.} Configured as code: the datasources, the dashboard provider and the
+dashboard (JSON) are copied into the image, so the whole configuration is versioned in git.
+For the ``?'' we chose the \textbf{Infinity} datasource plugin, which turns any JSON, CSV or
+XML endpoint into a datasource. We use it to show the average rating and the ratings
+captured by the feeder directly from our API, without writing an exporter.
+
+\section{Deployment}
+
+\subsection{Cluster}
+
+We used three Ubuntu 24.04 virtual machines in the same private network, all of them swarm
+managers so the cluster keeps working if one node fails (quorum of 2 out of 3). Node~1 has
+the label \texttt{db=true} and also runs the NFS server. A wildcard DNS record
+\texttt{*.<domain>} points to the nodes; thanks to the routing mesh any node accepts the
+traffic and forwards it to a frontend replica.
+
+\begin{lstlisting}
+docker swarm init --advertise-addr 10.0.0.4      # node1, then join node2 and node3
+docker node update --label-add db=true node1
+\end{lstlisting}
+
+\subsection{Shared storage}
+
+The NFS server needs a privileged container and swarm services can not be privileged, so it
+is the only service started with plain Compose on the storage node
+(\texttt{basic/nfs/nfs.yml}). It exports \texttt{/srv/nfs} with NFSv4 only, restricted to
+the cluster subnet. In \texttt{production.yml} the shared volumes use the \texttt{local}
+driver with \texttt{type: nfs}, so Docker mounts them automatically on whatever node a task
+is scheduled. Nothing is mounted by hand on the hosts.
+
+\subsection{Compose files}
+
+\begin{itemize}
+\item \texttt{compose.yml}: local environment, no TLS, named volumes only, mailpit instead
+of a real mail provider.
+\item \texttt{production.yml}: the whole infrastructure for the swarm. It keeps the
+\texttt{build:} keys, so the same file is used to build and push the images
+(\texttt{docker stack deploy} ignores them).
+\end{itemize}
+
+\subsection{Steps}
+
+\begin{lstlisting}
+set -a; . ./.env; set +a                # docker stack does not read .env
+docker compose -f production.yml build
+docker compose -f production.yml push
+docker stack deploy --with-registry-auth -c production.yml lab1
+\end{lstlisting}
+
+The images are pulled from our registry at \texttt{127.0.0.1:5000}. This address works on
+every node because the registry port is published on the routing mesh, and Docker accepts
+plain HTTP for localhost. On the very first deployment the registry does not exist yet, so we
+deploy once (the registry starts and the other services wait), push the images and deploy
+again. \texttt{--with-registry-auth} forwards the registry login to the other nodes.
+
+\section{Scalability}
+
+No service uses \texttt{container\_name}, fixed IPs or host ports other than the routing
+mesh, so all of them can run with several containers. Table~\ref{tab:scale} shows the
+replicas we use and why some are kept at one.
+
+\begin{table}[h]
+\centering\small
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+Service & Replicas & Reason \\
+\midrule
+\svc{core} & 3 & stateless, data in PostgreSQL and Redis \\
+\svc{frontend}, \svc{static}, \svc{smtp} & 2 & stateless \\
+\svc{registry} & 2 & storage on NFS, same \texttt{REGISTRY\_HTTP\_SECRET} \\
+\svc{moodle} & 2 & moodledata on NFS, sessions in the database \\
+\svc{grafana} & 2 & its state is in PostgreSQL, not in a local SQLite \\
+\svc{cadvisor} & global & one per node \\
+\svc{db}, \svc{moodle-db} & 1 & DBMS without automatic scaling \\
+\svc{redis}, \svc{prometheus} & 1 & in-memory cache / local time series database \\
+\svc{letsencrypt}, \svc{backup}, \svc{moodle-cron}, \svc{auto} & 1 & periodic jobs \\
+\bottomrule
+\end{tabularx}
+\caption{Replicas per service.}
+\label{tab:scale}
+\end{table}
+
+Updates use \texttt{order: start-first} and \texttt{failure\_action: rollback}, so a new
+version only replaces the old one if it starts correctly. Prometheus discovers the replicas
+of the core app with the DNS name \texttt{tasks.core}, so after
+\texttt{docker service scale lab1\_core=5} the new containers appear in Grafana without
+changes. The footer of the app shows the container that answered, which makes the load
+balancing easy to see.
+
+\section{Data management and backups}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lll}
+\toprule
+Data & Volume & Location \\
+\midrule
+PostgreSQL, MariaDB, Prometheus & \texttt{db}, \texttt{moodle-db}, \texttt{prometheus} & local disk of node 1 \\
+moodledata & \texttt{moodledata} & NFS \\
+certificates, ACME challenges & \texttt{certs}, \texttt{acme} & NFS \\
+registry images & \texttt{registry} & NFS \\
+backups & \texttt{backups} & NFS \\
+Redis & none & memory only (cache) \\
+\bottomrule
+\end{tabular}
+\caption{Where the data is stored.}
+\end{table}
+
+We decided not to put the databases on NFS: database engines on network filesystems risk
+corruption with locking problems or network cuts, and they are slow. They are pinned with a
+placement constraint to the node labelled \texttt{db=true} and use local volumes; what goes
+to the shared disk are the dumps.
+
+The \svc{backup} service is an Alpine image with \texttt{crond}. Every night at 03:30 it
+creates a folder in the backup volume with:
+\begin{itemize}
+\item \texttt{app.dump} and \texttt{grafana.dump}: \texttt{pg\_dump -Fc} (custom format,
+allows restoring single tables);
+\item \texttt{moodle.sql.gz}: \texttt{mariadb-dump --single-transaction}, consistent
+without locking the tables;
+\item \texttt{moodledata.tar.gz}: moodledata without caches, sessions and temporary files.
+\end{itemize}
+Folders older than 14 days are deleted. A backup can be launched by hand with
+\texttt{docker exec <backup container> /backup.sh}. Restoring, from node 1:
+
+\begin{lstlisting}
+docker exec -i <db container> pg_restore -U app -d app --clean < /srv/nfs/backups/<date>/app.dump
+gunzip -c /srv/nfs/backups/<date>/moodle.sql.gz | docker exec -i <moodle-db container> \
+  sh -c 'mariadb -u moodle -p"$(cat /run/secrets/moodle_db_password)" moodle'
+tar -xzf /srv/nfs/backups/<date>/moodledata.tar.gz -C /srv/nfs/moodledata
+\end{lstlisting}
+
+The main limitation is that the backups are on the same server as the shared data. For a
+real deployment we would copy them off-site (for example with restic to object storage) and
+encrypt them. Also, if node~1 fails, the databases stop until they are restored on another
+node from the last dump.
+
+\section{Security}
+
+\begin{itemize}
+\item Only nginx is exposed; port 80 only serves ACME challenges and redirects to HTTPS
+(TLS 1.2/1.3 and HSTS).
+\item Passwords are Docker secrets mounted in \texttt{/run/secrets}, never written in the
+compose files; the \texttt{secrets/} folder is ignored by git.
+\item The overlay networks \texttt{proxy}, \texttt{app} and \texttt{atenea} are encrypted
+(IPsec between nodes), and each stack is isolated in its own network.
+\item The SMTP relay is not published and only accepts mail from the internal networks.
+\item The registry requires authentication (bcrypt htpasswd) and \texttt{/metrics} is not
+reachable from outside.
+\end{itemize}
+Known weak points: ports published by Docker skip the host firewall (ufw), so the registry
+port 5000 must be closed in the cloud provider firewall; and the NFS export uses
+\texttt{no\_root\_squash} because some containers write as root, which we limited to the
+cluster subnet.
+
+\section{Conclusions}
+
+The whole infrastructure is deployed with one command per step (build, push, deploy) and
+every service can run on any node, except the databases, which we pinned on purpose. The
+part that took the most time was Moodle (installation with several replicas and the shared
+moodledata) and making nginx start before the real certificate existed.
+
+\subsection*{Work distribution}
+\begin{tabularx}{\textwidth}{lX}
+Member 1 & basic stack: frontend, Let's Encrypt, registry, NFS \\
+Member 2 & core app, static files, Redis \\
+Member 3 & databases, SMTP relay, feeder, backups \\
+Member 4 & Atenea (Moodle and MariaDB) \\
+Member 5 & stats stack and swarm cluster \\
+\end{tabularx}
+
+\end{document}

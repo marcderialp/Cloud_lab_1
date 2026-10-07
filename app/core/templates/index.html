@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Lab1 Reviews</title>
+  <link rel="stylesheet" href="/static/style.css">
+  {% if total %}
+  <script type="application/ld+json">
+  {"@context": "https://schema.org", "@type": "Product", "name": "Lab1",
+   "aggregateRating": {"@type": "AggregateRating", "ratingValue": {{ avg }}, "reviewCount": {{ total }}}}
+  </script>
+  {% endif %}
+</head>
+<body>
+  <h1>Lab1 Reviews</h1>
+  <p>Average: {{ avg or '-' }} / 5 ({{ total }} reviews)</p>
+  <form method="post" action="/comment">
+    <input name="author" placeholder="Name" required>
+    <select name="rating">{% for r in range(5, 0, -1) %}<option>{{ r }}</option>{% endfor %}</select>
+    <textarea name="body" placeholder="Comment" required></textarea>
+    <button>Send</button>
+  </form>
+  {% for author, body, rating in comments %}
+  <p><b>{{ author }}</b> ({{ rating }}/5): {{ body }}</p>
+  {% endfor %}
+  <footer>served by {{ host }}</footer>
+</body>
+</html>

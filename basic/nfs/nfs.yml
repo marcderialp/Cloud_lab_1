@@ -1,0 +1,11 @@
+# Runs on the storage node with plain compose (swarm can not run privileged containers):
+#   docker compose -f basic/nfs/nfs.yml up -d --build
+services:
+  nfs:
+    build: .
+    privileged: true
+    restart: unless-stopped
+    environment:
+      NFS_CLIENTS: 10.0.0.0/24
+    ports: ["2049:2049"]
+    volumes: ["/srv/nfs:/exports"]
