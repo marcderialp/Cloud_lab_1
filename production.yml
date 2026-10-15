@@ -1,179 +1,433 @@
-# Production on docker swarm:
-#   docker compose -f production.yml build && docker compose -f production.yml push
-#   docker stack deploy --with-registry-auth -c production.yml lab1
-# (export the variables of .env first: set -a; . ./.env; set +a)
+# Production on docker swarm: the 7-node architecture (front x2, app x2, stats, atenea, backup).
+# In this project it runs on our own computer (scripts/sim-swarm.sh builds the 7 nodes with
+# docker-in-docker) and serves HTTPS with a self-signed certificate on https://app.localhost,
+# https://lms.localhost and https://grafana.localhost. It is not opened to the Internet.
+#
+#   scripts/label-nodes.sh                   # once, after the nodes joined the swarm (prints NFS_SERVER)
+#   export NFS_SERVER=<private IP of the atenea node>
+#   docker stack deploy -c production.yml lab1
+#
+# Images come from Docker Hub (omarcornejo/lab1grouph:<service>-<TAG>), published with
+# scripts/publish.sh. Everything has a default except NFS_SERVER. A real domain
+# (DOMAIN, LE_EMAIL) would make certbot issue a Let's Encrypt certificate; with a local
+# name such as the default "localhost" the letsencrypt service stays idle.
 
-x-scalable: &scalable
+# stateless services: 2 replicas, exactly one per node (max_replicas_per_node), so a node
+# failure never takes both. With one replica per node there is no free slot for start-first,
+# so the update goes one replica at a time (stop-first): the other one keeps serving.
+x-stateless: &stateless
   replicas: 2
-  update_config: { order: start-first, failure_action: rollback }
+  placement: { max_replicas_per_node: 1 }
+  update_config: { order: stop-first, parallelism: 1, delay: 10s, failure_action: rollback, monitor: 20s }
+  rollback_config: { order: stop-first }
+  restart_policy: { condition: any, delay: 5s }
+x-stateful: &stateful
+  replicas: 1
+  update_config: { order: stop-first, failure_action: rollback, monitor: 20s }
+  restart_policy: { condition: any, delay: 5s }
 x-single: &single
   replicas: 1
-x-on-db-node: &on-db-node
-  replicas: 1
-  placement: { constraints: [node.labels.db == true] }
-x-nfs: &nfs "addr=${NFS_SERVER},nfsvers=4,rw,hard"
+  restart_policy: { condition: any, delay: 10s }
 
+# NFS_SERVER (private IP of the atenea node, printed by scripts/label-nodes.sh) is required
+x-nfs: &nfs "addr=${NFS_SERVER:?NFS_SERVER is required},nfsvers=4.2,rw,hard"
 x-moodle: &moodle
-  image: ${REGISTRY}/lab1/moodle
-  environment: { MOODLE_URL: "https://lms.${DOMAIN}" }
-  secrets: [moodle_db_password, moodle_admin_password]
-  volumes: [moodledata:/var/moodledata]
-  networks: [proxy, atenea]
+  image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:moodle-${TAG:-1.0}
+  environment: { MOODLE_URL: "https://lms.${DOMAIN:-localhost}" }
+  secrets: [ moodle_db_password, moodle_admin_password ]
+  volumes: [ moodledata:/var/moodledata ]
+  networks: [ proxy, atenea ]
 
 services:
-  # ---------- basic ----------
+  # ================= basic (front nodes) =================
   frontend:
-    image: ${REGISTRY}/lab1/frontend
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:frontend-${TAG:-1.0}
     build: ./basic/frontend
-    environment: { DOMAIN: "${DOMAIN}", TLS: "true", NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates-prod }
-    ports: ["80:80", "443:443"]
-    volumes: [certs:/etc/letsencrypt:ro, acme:/var/www/acme:ro]
-    networks: [proxy]
-    deploy: *scalable
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      TLS: "true"
+      CERT_PASSWORD: ${CERT_PASSWORD:-groupH}
+      NODE: "{{.Node.Hostname}}"
+      NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates-prod
+    ports: [ "80:80", "443:443", "8080:8080" ]   # 8080: web page of the mail catcher
+    volumes: [ "certs:/etc/letsencrypt:ro", "acme:/var/www/acme:ro" ]
+    networks: [ proxy ]
+    deploy:
+      <<: *stateless
+      placement: { max_replicas_per_node: 1, constraints: [ "node.labels.role == front" ] }
 
+  # gets the certificate by itself (HTTP-01 through the frontend) and renews it; the
+  # frontend starts with a self signed one and switches when this one exists
   letsencrypt:
     image: certbot/certbot:v2.11.0
-    entrypoint: >
-      sh -c 'sleep 60; while true; do
-      certbot certonly --webroot -w /var/www/acme --cert-name ${DOMAIN} --keep-until-expiring
-      -d app.${DOMAIN} -d lms.${DOMAIN} -d grafana.${DOMAIN} -d registry.${DOMAIN}
-      --email ${LE_EMAIL} --agree-tos -n; sleep 12h; done'
-    volumes: [certs:/etc/letsencrypt, acme:/var/www/acme]
-    deploy: *single
-
-  registry:
-    image: registry:2.8.3
+    entrypoint:
+      - sh
+      - -c
+      - |
+        case "$${DOMAIN}" in
+          localhost|*.localhost|*.local|*.lan|*.internal)
+            echo "local domain $${DOMAIN}: no certificate requested, nginx keeps its self-signed one"
+            while true; do sleep 86400; done ;;
+        esac
+        until certbot certonly --webroot -w /var/www/acme --cert-name $${DOMAIN} --keep-until-expiring \
+            -d app.$${DOMAIN} -d lms.$${DOMAIN} -d grafana.$${DOMAIN} \
+            --email $${LE_EMAIL} --agree-tos --non-interactive; do
+          echo "certificate not issued yet (DNS? port 80?), retrying in 10 min"; sleep 600
+        done
+        while true; do sleep 12h; certbot renew --quiet; done
     environment:
-      REGISTRY_HTTP_SECRET: ${REGISTRY_HTTP_SECRET}
-      REGISTRY_AUTH: htpasswd
-      REGISTRY_AUTH_HTPASSWD_REALM: lab1
-      REGISTRY_AUTH_HTPASSWD_PATH: /run/secrets/registry_htpasswd
-    secrets: [registry_htpasswd]
-    ports: ["5000:5000"]
-    volumes: [registry:/var/lib/registry]
-    networks: [proxy]
-    deploy: *scalable
+      DOMAIN: ${DOMAIN:-localhost}
+      LE_EMAIL: ${LE_EMAIL:-groupH@example.com}
+    volumes: [ "certs:/etc/letsencrypt", "acme:/var/www/acme" ]
+    deploy:
+      <<: *single
+      placement: { constraints: [ "node.labels.role == front" ] }
 
-  # ---------- app ----------
+  # NFS server inside the stack (user space, two capabilities, no privileged mode)
+  nfs:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:nfs-${TAG:-1.0}
+    build: ./basic/nfs
+    cap_add: [ DAC_READ_SEARCH, SYS_RESOURCE ]
+    environment:
+      NFS_CLIENTS: ${NFS_CLIENTS:-10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16}
+    ports: [ { target: 2049, published: 2049, protocol: tcp, mode: "${NFS_PORT_MODE:-host}" } ]
+    volumes: [ "nfs-data:/exports" ]
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == atenea" ] }
+
+  # ================= app (app nodes) =================
   core:
-    image: ${REGISTRY}/lab1/core
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:core-${TAG:-1.0}
     build: ./app/core
-    environment: { DB_PASSWORD_FILE: /run/secrets/db_password, FEED_TOKEN_FILE: /run/secrets/feed_token, NOTIFY_EMAIL: "${NOTIFY_EMAIL}" }
-    secrets: [db_password, feed_token]
-    networks: [proxy, app]
-    deploy: { <<: *scalable, replicas: 3 }
+    environment:
+      NODE: "{{.Node.Hostname}}"
+      DB_HOST: db
+      DB_USER: app
+      DB_PASSWORD_FILE: /run/secrets/app_db_password
+      FEED_TOKEN_FILE: /run/secrets/feed_token
+      REDIS_SENTINELS: sentinel-1,sentinel-2,sentinel-3
+      NOTIFY_EMAIL: ${NOTIFY_EMAIL:-groupH@example.com}
+    secrets: [ app_db_password, feed_token ]
+    networks: [ proxy, app ]
+    deploy:
+      <<: *stateless
+      placement: { max_replicas_per_node: 1, constraints: [ "node.labels.role == app" ] }
   static:
-    image: ${REGISTRY}/lab1/static
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:static-${TAG:-1.0}
     build: ./app/static
-    networks: [proxy]
-    deploy: *scalable
-  db:
-    image: postgres:16-alpine
-    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD_FILE: /run/secrets/db_password }
-    secrets: [db_password]
-    configs: [{ source: init_sql, target: /docker-entrypoint-initdb.d/init.sql }]
-    volumes: [db:/var/lib/postgresql/data]
-    networks: [app]
-    deploy: *on-db-node
-  redis:
-    image: redis:7.4-alpine
-    networks: [app]
-    deploy: *single
-  smtp:
-    image: ${REGISTRY}/lab1/smtp
-    build: ./app/smtp
-    environment: { RELAY_HOST: "${RELAY_HOST}", RELAY_PORT: "${RELAY_PORT}", RELAY_USER: "${RELAY_USER}", RELAY_PASSWORD: "${RELAY_PASSWORD}" }
-    networks: [app]
-    deploy: *scalable
-  auto:
-    image: ${REGISTRY}/lab1/auto
-    build: ./app/auto
-    environment: { FEED_TOKEN_FILE: /run/secrets/feed_token }
-    secrets: [feed_token]
-    networks: [app]
-    deploy: *single
-  backup:
-    image: ${REGISTRY}/lab1/backup
-    build: ./app/backup
-    secrets: [db_password, moodle_db_password]
-    volumes: [backups:/backups, moodledata:/moodledata:ro]
-    networks: [app, atenea]
-    deploy: *single
+    networks: [ proxy ]
+    deploy:
+      <<: *stateless
+      placement: { max_replicas_per_node: 1, constraints: [ "node.labels.role == app" ] }
 
-  # ---------- atenea ----------
-  # only moodle builds the image; moodle-cron reuses it (building it twice fails)
+  # postgres: three Patroni nodes (app1, app2, stats) with leader election in a three
+  # member etcd; haproxy ("db") always points to the leader, so after a failure the
+  # replicas elect a new leader by themselves and nothing else has to change
+  etcd-1: &etcd
+    image: quay.io/coreos/etcd:v3.5.15
+    command: [ etcd, --name=etcd-1, --data-dir=/etcd-data, --listen-client-urls=http://0.0.0.0:2379,
+               --advertise-client-urls=http://etcd-1:2379, --listen-peer-urls=http://0.0.0.0:2380,
+               --initial-advertise-peer-urls=http://etcd-1:2380,
+               "--initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380",
+               --initial-cluster-token=lab1 ]
+    volumes: [ "etcd-1:/etcd-data" ]
+    # no healthcheck on purpose: swarm DNS only resolves a service whose tasks are healthy, and
+    # the three members must resolve each other to form the quorum that makes them healthy
+    healthcheck: { disable: true }
+    networks: [ app ]
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == app", "node.labels.slot == 1" ] }
+  etcd-2:
+    <<: *etcd
+    command: [ etcd, --name=etcd-2, --data-dir=/etcd-data, --listen-client-urls=http://0.0.0.0:2379,
+               --advertise-client-urls=http://etcd-2:2379, --listen-peer-urls=http://0.0.0.0:2380,
+               --initial-advertise-peer-urls=http://etcd-2:2380,
+               "--initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380",
+               --initial-cluster-token=lab1 ]
+    volumes: [ "etcd-2:/etcd-data" ]
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == app", "node.labels.slot == 2" ] }
+  etcd-3:
+    <<: *etcd
+    command: [ etcd, --name=etcd-3, --data-dir=/etcd-data, --listen-client-urls=http://0.0.0.0:2379,
+               --advertise-client-urls=http://etcd-3:2379, --listen-peer-urls=http://0.0.0.0:2380,
+               --initial-advertise-peer-urls=http://etcd-3:2380,
+               "--initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380",
+               --initial-cluster-token=lab1 ]
+    volumes: [ "etcd-3:/etcd-data" ]
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == stats" ] }
+
+  pg-1: &pg
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:postgres-${TAG:-1.0}
+    build: ./app/db
+    hostname: pg-1
+    environment: &pg-env { PATRONI_NAME: pg-1, ETCD_HOSTS: "etcd-1:2379,etcd-2:2379,etcd-3:2379" }
+    secrets: [ pg_admin_password, replicator_password, app_db_password, grafana_db_password, backup_db_password, exporter_db_password ]
+    volumes: [ "pg-1:/var/lib/postgresql/data" ]
+    networks: [ app ]
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == app", "node.labels.slot == 1" ] }
+  pg-2:
+    <<: *pg
+    build: !reset null
+    hostname: pg-2
+    environment: { <<: *pg-env, PATRONI_NAME: pg-2 }
+    volumes: [ "pg-2:/var/lib/postgresql/data" ]
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == app", "node.labels.slot == 2" ] }
+  pg-3:
+    <<: *pg
+    build: !reset null
+    hostname: pg-3
+    environment: { <<: *pg-env, PATRONI_NAME: pg-3 }
+    volumes: [ "pg-3:/var/lib/postgresql/data" ]
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == stats" ] }
+  db:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:haproxy-${TAG:-1.0}
+    build: ./app/haproxy
+    networks: [ app ]
+    deploy:
+      <<: *stateless
+      placement: { max_replicas_per_node: 1, constraints: [ "node.labels.role == app" ] }
+
+  # redis: master on slot 1, replica on slot 2, three sentinels (slot 1, slot 2, stats)
+  redis-1:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:redis-${TAG:-1.0}
+    build: ./app/redis
+    environment: { ANNOUNCE: redis-1 }
+    networks: [ app ]
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == app", "node.labels.slot == 1" ] }
+  redis-2:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:redis-${TAG:-1.0}
+    environment: { ANNOUNCE: redis-2, REPLICAOF: redis-1 }
+    networks: [ app ]
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == app", "node.labels.slot == 2" ] }
+  sentinel-1: &sentinel
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:sentinel-${TAG:-1.0}
+    build: ./app/sentinel
+    environment: { MASTER_HOST: redis-1, QUORUM: "2" }
+    networks: [ app ]
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == app", "node.labels.slot == 1" ] }
+  sentinel-2:
+    <<: *sentinel
+    build: !reset null
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == app", "node.labels.slot == 2" ] }
+  sentinel-3:
+    <<: *sentinel
+    build: !reset null
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == stats" ] }
+
+  smtp:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:smtp-${TAG:-1.0}
+    build: ./app/smtp
+    # by default the relay is mailpit (a mail catcher with a web page), so the mails of the
+    # application can be read without any external provider; to send real mail set
+    # RELAY_HOST/RELAY_PORT/RELAY_USER/RELAY_PASSWORD and SMTP_TLS=encrypt
+    environment:
+      RELAY_HOST: ${RELAY_HOST:-mailpit}
+      RELAY_PORT: ${RELAY_PORT:-1025}
+      RELAY_USER: ${RELAY_USER:-}
+      RELAY_PASSWORD: ${RELAY_PASSWORD:-}
+      SMTP_TLS: ${SMTP_TLS:-none}
+    networks: [ app ]
+    deploy:
+      <<: *stateless
+      placement: { max_replicas_per_node: 1, constraints: [ "node.labels.role == app" ] }
+  mailpit:
+    image: axllent/mailpit:v1.21
+    networks: [ app, proxy ]
+    deploy:
+      <<: *single
+      placement: { constraints: [ "node.labels.role == app" ] }
+  auto:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:auto-${TAG:-1.0}
+    build: ./app/auto
+    environment: { FEED_TOKEN_FILE: /run/secrets/feed_token, FEED_API: "http://core:8000" }
+    secrets: [ feed_token ]
+    networks: [ app ]
+    deploy:
+      <<: *single
+      placement: { constraints: [ "node.labels.role == app" ] }
+
+  # ================= atenea (atenea node) =================
+  # only moodle builds the image; moodle-cron reuses it
   moodle:
     <<: *moodle
     build: ./atenea/moodle
-    deploy: *scalable
+    deploy:
+      <<: *stateless
+      placement: { constraints: [ "node.labels.role == atenea" ] }
   moodle-cron:
     <<: *moodle
-    command: sh -c 'while true; do su -s /bin/sh www-data -c "php admin/cli/cron.php"; sleep 60; done'
-    networks: [atenea]
-    deploy: *single
+    command: sh -c 'while true; do su -s /bin/sh www-data -c "php admin/cli/cron.php"; touch /tmp/cron.alive; sleep 60; done'
+    # the image checks apache, which this container does not run: check the loop instead
+    healthcheck: { test: [ CMD-SHELL, "find /tmp/cron.alive -mmin -5 | grep -q ." ], interval: 30s, timeout: 5s, start_period: 600s, retries: 3 }
+    networks: [ atenea ]
+    deploy:
+      <<: *single
+      placement: { constraints: [ "node.labels.role == atenea" ] }
   moodle-db:
-    image: mariadb:11.4
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:moodle-db-${TAG:-1.0}
+    build: ./atenea/mariadb
     environment:
       MARIADB_DATABASE: moodle
       MARIADB_USER: moodle
       MARIADB_PASSWORD_FILE: /run/secrets/moodle_db_password
       MARIADB_RANDOM_ROOT_PASSWORD: "yes"
-    secrets: [moodle_db_password]
-    volumes: [moodle-db:/var/lib/mysql]
-    networks: [atenea]
-    deploy: *on-db-node
+    secrets: [ moodle_db_password, exporter_db_password, backup_db_password ]
+    volumes: [ "moodle-db:/var/lib/mysql" ]
+    networks: [ atenea ]
+    deploy:
+      <<: *stateful
+      placement: { constraints: [ "node.labels.role == atenea" ] }
 
-  # ---------- stats ----------
+  # ================= backup (backup node) =================
+  # encrypted dumps on the local disk of a node that is neither an app node nor the NFS node
+  backup:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:backup-${TAG:-1.0}
+    build: ./app/backup
+    environment:
+      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-30 3 * * *}
+      RESTORE_TEST_SCHEDULE: ${RESTORE_TEST_SCHEDULE:-0 5 * * 0}
+      RETENTION_DAYS: ${RETENTION_DAYS:-14}
+    secrets: [ backup_db_password, backup_passphrase ]
+    volumes: [ "backups:/backups", "moodledata:/moodledata:ro" ]
+    networks: [ app, atenea, stats ]
+    deploy:
+      <<: *single
+      placement: { constraints: [ "node.labels.role == backup" ] }
+
+  # ================= stats (stats node) =================
   grafana:
-    image: ${REGISTRY}/lab1/grafana
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:grafana-${TAG:-1.0}
     build: ./stats/grafana
     environment:
-      GF_SERVER_ROOT_URL: https://grafana.${DOMAIN}
+      GF_SERVER_ROOT_URL: https://grafana.${DOMAIN:-localhost}
       GF_DATABASE_TYPE: postgres
       GF_DATABASE_HOST: db:5432
       GF_DATABASE_NAME: grafana
-      GF_DATABASE_USER: app
-      GF_DATABASE_PASSWORD__FILE: /run/secrets/db_password
+      GF_DATABASE_USER: grafana
+      GF_DATABASE_PASSWORD__FILE: /run/secrets/grafana_db_password
       GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
-    secrets: [db_password, grafana_admin_password]
-    networks: [proxy, stats, app]
-    deploy: *scalable
+    secrets: [ grafana_db_password, grafana_admin_password ]
+    networks: [ proxy, stats, app ]
+    deploy:
+      <<: *stateless
+      placement: { constraints: [ "node.labels.role == stats" ] }
+      # two processes on the same node: HA of the process, not of the node
+  # two replicas on two nodes (stats and backup), each with its own time series database;
+  # both scrape the same targets, so the one that answers is equivalent
   prometheus:
-    image: ${REGISTRY}/lab1/prometheus
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:prometheus-${TAG:-1.0}
     build: ./stats/prometheus
-    volumes: [prometheus:/prometheus]
-    networks: [stats, app]
-    deploy: *on-db-node
+    command: [ --config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.path=/prometheus, --storage.tsdb.retention.time=15d ]
+    volumes: [ "/prometheus" ]   # anonymous volume: each replica keeps its own TSDB
+    networks: [ stats, proxy, app ]
+    deploy:
+      <<: *stateless
+      placement:
+        max_replicas_per_node: 1
+        constraints: [ "node.labels.role != front", "node.labels.role != app", "node.labels.role != atenea" ]
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
-    volumes: ["/:/rootfs:ro", "/var/run:/var/run:ro", "/sys:/sys:ro", "/var/lib/docker:/var/lib/docker:ro"]
-    networks: [stats]
+    volumes: [ "/:/rootfs:ro", "/var/run:/var/run:ro", "/sys:/sys:ro", "/var/lib/docker:/var/lib/docker:ro" ]
+    networks: [ stats ]
     deploy: { mode: global }
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    command: [ --path.rootfs=/host ]
+    volumes: [ "/:/host:ro,rslave" ]
+    networks: [ stats ]
+    deploy: { mode: global }
+  pg-exporter-1: &pgexp
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment: &pgexp-env
+      DATA_SOURCE_URI: pg-1:5432/postgres?sslmode=disable
+      DATA_SOURCE_USER: exporter
+      DATA_SOURCE_PASS_FILE: /run/secrets/exporter_db_password
+    secrets: [ exporter_db_password ]
+    networks: [ stats, app ]
+    deploy:
+      <<: *single
+      placement: { constraints: [ "node.labels.role == stats" ] }
+  pg-exporter-2:
+    <<: *pgexp
+    environment: { <<: *pgexp-env, DATA_SOURCE_URI: "pg-2:5432/postgres?sslmode=disable" }
+  pg-exporter-3:
+    <<: *pgexp
+    environment: { <<: *pgexp-env, DATA_SOURCE_URI: "pg-3:5432/postgres?sslmode=disable" }
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    networks: [ stats, app ]
+    deploy:
+      <<: *single
+      placement: { constraints: [ "node.labels.role == stats" ] }
+  mysqld-exporter:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:mysqld-exporter-${TAG:-1.0}
+    build: ./stats/mysqld-exporter
+    secrets: [ exporter_db_password ]
+    networks: [ stats, atenea ]
+    deploy:
+      <<: *single
+      placement: { constraints: [ "node.labels.role == stats" ] }
+  blackbox:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:blackbox-${TAG:-1.0}
+    build: ./stats/blackbox
+    networks: [ stats, proxy, app ]
+    deploy:
+      <<: *single
+      placement: { constraints: [ "node.labels.role == stats" ] }
 
 networks:
   proxy: { driver: overlay, driver_opts: { encrypted: "true" } }
   app: { driver: overlay, driver_opts: { encrypted: "true" } }
   atenea: { driver: overlay, driver_opts: { encrypted: "true" } }
-  stats: { driver: overlay }
+  stats: { driver: overlay, driver_opts: { encrypted: "true" } }
 
 volumes:
-  # shared, on NFS
+  # shared, on NFS (the nfs service of the atenea node)
   certs: { driver_opts: { type: nfs, o: *nfs, device: ":/letsencrypt" } }
   acme: { driver_opts: { type: nfs, o: *nfs, device: ":/acme" } }
-  registry: { driver_opts: { type: nfs, o: *nfs, device: ":/registry" } }
   moodledata: { driver_opts: { type: nfs, o: *nfs, device: ":/moodledata" } }
-  backups: { driver_opts: { type: nfs, o: *nfs, device: ":/backups" } }
-  # local disk of the db node
-  db: {}
+  # local disk of the node that runs each service
+  nfs-data: {}
+  etcd-1: {}
+  etcd-2: {}
+  etcd-3: {}
+  pg-1: {}
+  pg-2: {}
+  pg-3: {}
   moodle-db: {}
-  prometheus: {}
+  backups: {}
 
-configs:
-  init_sql: { file: ./app/init.sql }
 secrets:
-  db_password: { file: ./secrets/db_password }
+  pg_admin_password: { file: ./secrets/pg_admin_password }
+  app_db_password: { file: ./secrets/app_db_password }
+  grafana_db_password: { file: ./secrets/grafana_db_password }
+  replicator_password: { file: ./secrets/replicator_password }
+  backup_db_password: { file: ./secrets/backup_db_password }
+  exporter_db_password: { file: ./secrets/exporter_db_password }
   moodle_db_password: { file: ./secrets/moodle_db_password }
   moodle_admin_password: { file: ./secrets/moodle_admin_password }
   grafana_admin_password: { file: ./secrets/grafana_admin_password }
   feed_token: { file: ./secrets/feed_token }
-  registry_htpasswd: { file: ./secrets/registry_htpasswd }
+  backup_passphrase: { file: ./secrets/backup_passphrase }

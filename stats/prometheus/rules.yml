@@ -1,0 +1,29 @@
+groups:
+  - name: lab1
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        annotations: { summary: "{{ $labels.job }} {{ $labels.instance }} is down" }
+      - alert: SiteDown
+        expr: probe_success == 0
+        for: 1m
+        annotations: { summary: "{{ $labels.instance }} does not answer" }
+      - alert: PostgresReplicaLag
+        expr: pg_replication_lag_seconds > 30
+        for: 2m
+        annotations: { summary: "the replica is {{ $value }} s behind the primary" }
+      - alert: PostgresWithoutOneLeader
+        expr: sum(patroni_primary) != 1
+        for: 30s
+        annotations: { summary: "the Patroni cluster must have exactly one leader" }
+      - alert: RedisWithoutOneMaster
+        expr: sum(redis_instance_info{role="master"}) != 1
+        for: 1m
+        annotations: { summary: "there must be exactly one redis master" }
+      - alert: BackupTooOld
+        expr: time() - backup_last_success_timestamp_seconds > 90000
+        annotations: { summary: "the last successful backup is older than 25 h" }
+      - alert: RestoreTestFailed
+        expr: backup_restore_test_ok == 0
+        annotations: { summary: "the last backup could not be restored" }

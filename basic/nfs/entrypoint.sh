@@ -1,13 +1,8 @@
 #!/bin/sh
-# NFSv4 server, only port 2049
+# Exports /exports (a volume on this node) to the private networks (NFS_CLIENTS).
 set -e
-for d in letsencrypt acme registry moodledata backups; do mkdir -p /exports/$d; done
-chown 33:33 /exports/moodledata
-echo "/exports ${NFS_CLIENTS:-10.0.0.0/8}(rw,fsid=0,sync,no_subtree_check,no_root_squash)" > /etc/exports
-mount -t nfsd nfsd /proc/fs/nfsd || true
-rpcbind -w
-rpc.nfsd -N 3 -V 4 8
-exportfs -rv
-trap 'exportfs -ua; rpc.nfsd 0; exit 0' TERM INT
-rpc.mountd -N 2 -N 3 -V 4 -F &
-wait $!
+for d in letsencrypt acme moodledata; do mkdir -p /exports/$d; done
+chown 33:33 /exports/moodledata   # www-data of the moodle image
+chmod 755 /exports/letsencrypt /exports/acme
+sed "s#@CLIENTS@#${NFS_CLIENTS:-10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16}#" /ganesha.conf.tpl > /etc/ganesha/ganesha.conf
+exec ganesha.nfsd -F -L /dev/stdout -f /etc/ganesha/ganesha.conf

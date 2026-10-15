@@ -18,10 +18,11 @@ while True:
             for block in LDJSON.findall(html):
                 rating = json.loads(block).get("aggregateRating", {}).get("ratingValue")
                 if rating is not None:
-                    requests.post("http://core:8000/api/ratings", timeout=10,
+                    requests.post(os.environ.get("FEED_API", "http://core:8000") + "/api/ratings", timeout=10,
                                   json={"url": url, "rating": rating},
                                   headers={"Authorization": "Bearer " + TOKEN})
                     print(url, rating)
         except Exception as e:
             print("error with", url, e)
+    open("/tmp/alive", "w").close()  # heartbeat for the healthcheck
     time.sleep(int(os.environ.get("FEED_INTERVAL", "300")))

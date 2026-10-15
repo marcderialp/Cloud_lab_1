@@ -1,6 +1,9 @@
 FROM alpine:3.20
-RUN apk add --no-cache postgresql16-client mariadb-client tar
-COPY backup.sh /backup.sh
-RUN chmod +x /backup.sh
-# cron jobs do not see the container environment, so we save it first
-CMD ["sh", "-c", "export -p > /env && echo \"${BACKUP_SCHEDULE:-30 3 * * *} /backup.sh > /proc/1/fd/1 2>&1\" > /etc/crontabs/root && exec crond -f"]
+# clients for the dumps, openssl for the encryption and the servers (only used
+# by restore-test.sh, to prove that a backup can really be restored)
+RUN apk add --no-cache postgresql16 postgresql16-client mariadb mariadb-client openssl tar su-exec busybox-extras
+COPY lib.sh backup.sh restore-test.sh entrypoint.sh /
+RUN chmod +x /backup.sh /restore-test.sh /entrypoint.sh
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD pidof crond >/dev/null && wget -qO /dev/null http://127.0.0.1:9199/metrics || exit 1
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,14 +1,26 @@
 \documentclass[11pt,a4paper]{article}
-\usepackage[margin=2.3cm]{geometry}
-\usepackage{booktabs,tabularx,enumitem,listings,xcolor}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{booktabs,tabularx,enumitem,listings,xcolor,array}
+\usepackage{longtable}
+\usepackage{tikz}
+\usetikzlibrary{positioning,fit,backgrounds,arrows.meta,calc}
 \usepackage[hidelinks]{hyperref}
 
 \lstset{basicstyle=\ttfamily\small,backgroundcolor=\color{gray!8},frame=single,
         rulecolor=\color{gray!40},breaklines=true,columns=fullflexible}
 \setlist{nosep}
 \newcommand{\svc}[1]{\texttt{#1}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
 
-\title{Laboratory 1: Short project\\[2pt]\large Docker, Compose and Swarm}
+\definecolor{cfront}{HTML}{DDE7FF}
+\definecolor{capp}{HTML}{DFF5E1}
+\definecolor{cstats}{HTML}{FFF1CC}
+\definecolor{catenea}{HTML}{FFE0E0}
+\definecolor{cbackup}{HTML}{E8DEFF}
+
+\title{Laboratory 1: Short project\\[2pt]\large Docker, Compose and Swarm --- high availability edition}
 \author{Marc De Rialp \and David Franco \and Omar Antonio Cornejo \and David Madrid \and Victor Yakovlev\\[4pt]
 \small Cloud Computing and Distributed Systems\\ MSc in Machine Learning and Cybersecurity for Internet Connected Systems, UPC}
 \date{October 2026}
@@ -17,262 +29,576 @@
 \begin{document}
 \maketitle
 
+\begin{abstract}
+We containerised the digital infrastructure of a company with Docker: a shared stack
+(web front, certificates, shared disk), a reviews application with its database, cache,
+mail relay and backups, a monitoring platform, and the Moodle learning management system.
+The same project runs in two environments: a local one on a single machine
+(\texttt{compose.yml}) and a production one on a Docker Swarm of seven nodes
+(\texttt{production.yml}), in which every user-facing service is replicated, the database
+and the cache are clustered and fail over by themselves, and the backups are encrypted and
+kept on a node of their own. The images are published in Docker Hub, so deploying only
+needs to pull and start them. The report describes the design, the deployment, the
+management of data and backups, the monitoring, the test cases and their results.
+\end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
+
 \section{Introduction}
 
 We containerised the infrastructure of Figure~1 of the statement: the shared services
 (\emph{basic}), a company application (\emph{app}), an observability platform
-(\emph{stats}) and Moodle (\emph{atenea}). As the core application we wrote a small review
-site in Flask: people leave a comment with a rating from 1 to 5, the average is cached in
-Redis, each new comment sends a mail through our SMTP relay and an automatic feeder
+(\emph{stats}) and Moodle (\emph{atenea}). As the core application we wrote a review site
+in Flask: people leave a comment with a rating from 1 to 5, see the distribution and the
+latest reviews, each new comment sends a mail through our SMTP relay and an automatic feeder
 collects ratings published in other web pages.
 
-The repository contains \texttt{compose.yml} (local), \texttt{production.yml} (swarm),
-one folder per image with its Dockerfile and files, and this document.
+This version goes beyond a single working deployment: every user-facing piece has at least
+two replicas on different nodes, the application database and the cache are clustered, the
+backups are encrypted and kept on a node of their own, and every service is monitored.
+Everything is deployed with one \texttt{docker compose up} (local) or one
+\texttt{docker stack deploy} (production), with the images already published in Docker Hub.
+
+The repository contains \texttt{compose.yml} (local), \texttt{production.yml} (swarm), one
+folder per image with its Dockerfile and files, \texttt{scripts/} (node labels, publication,
+simulated swarm and restore) and this document. The local environment has no TLS and uses
+named volumes, but it contains the same clusters (database, cache) as production, so they can
+be tested on one machine.
 
 \section{Architecture}
 
-Table~\ref{tab:services} maps the boxes of the diagram to our services. Each stack is an
-overlay network, and a service only joins the networks it needs. For example the
-databases are not in the \texttt{proxy} network, so the frontend can not reach them.
+\subsection{Nodes}
 
-\begin{table}[h]
+The swarm has seven nodes; the placement is done with the node label \texttt{role}
+(and \texttt{slot} for the two app nodes, to keep a primary and its replica apart).
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  vm/.style={draw,rounded corners=4pt,text width=4.2cm,align=left,inner sep=5pt,font=\scriptsize},
+  arr/.style={-{Stealth[length=1.8mm]},thick,gray!70!black},
+  lab/.style={font=\tiny,fill=white,inner sep=1pt}]
+\node[vm,fill=cfront]  (f1) at (0,0)    {\textbf{front1} \hfill role=front\\ frontend (nginx, cache, TLS)\\ letsencrypt (idle)};
+\node[vm,fill=cfront]  (f2) at (5.6,0)  {\textbf{front2} \hfill role=front\\ frontend (nginx, cache, TLS)\\ \phantom{x}};
+\node[vm,fill=cstats]  (st) at (11.2,0) {\textbf{stats} \hfill role=stats\\ grafana x2, prometheus\\ exporters, blackbox\\ postgres \textbf{pg-3}, etcd-3, sentinel-3};
+\node[vm,fill=capp]    (a1) at (0,-3.2)   {\textbf{app1} \hfill role=app slot=1\\ core, static, smtp, auto, haproxy\\ postgres pg-1 + etcd-1\\ redis \textbf{master} + sentinel-1};
+\node[vm,fill=capp]    (a2) at (5.6,-3.2) {\textbf{app2} \hfill role=app slot=2\\ core, static, smtp, haproxy\\ postgres pg-2 + etcd-2\\ redis \textbf{replica} + sentinel-2};
+\node[vm,fill=catenea] (at) at (0,-6.4)   {\textbf{atenea} \hfill role=atenea\\ moodle x2, moodle-cron\\ mariadb\\ nfs (ganesha): moodledata, certs};
+\node[vm,fill=cbackup] (bk) at (5.6,-6.4) {\textbf{backup} \hfill role=backup\\ cron: encrypted dumps\\ restore test + metrics\\ local disk};
+\node[font=\scriptsize\itshape,text width=3.7cm,align=left] at (11.2,-3.2) {Browser $\to$ front nodes (routing mesh). Postgres: 3 Patroni nodes (app1, app2, stats), one leader. Prometheus scrapes every node.};
+\draw[arr] (f1) -- (a1);
+\draw[arr] (f2) -- (a2);
+\draw[arr,<->] (a1) -- node[lab,above]{repl.} (a2);
+\draw[arr,dashed] (a1) -- node[lab,pos=.5,xshift=-8mm]{Moodle via proxy} (at);
+\draw[arr] (bk) -- node[lab,pos=.5,xshift=12mm]{pg\_dump (replica)} (a2);
+\draw[arr] (bk) -- node[lab,above]{dumps} (at);
+\end{tikzpicture}
+\caption{Nodes and services (simplified). The routing mesh accepts the traffic on both front
+nodes; \svc{backup} pulls from a replica, from MariaDB and from the NFS volume.}
+\label{fig:nodes}
+\end{figure}
+
+\subsection{Services}
+
+Table~\ref{tab:services} maps the boxes of the diagram of the statement to our services,
+the node where they run and their replicas. Each stack is an encrypted overlay network and
+a service only joins the networks it needs: the databases are not in the \texttt{proxy}
+network, so the frontend can not reach them.
+
+\begin{table}[ht]
 \centering\small
-\begin{tabularx}{\textwidth}{llX}
+\begin{tabularx}{\textwidth}{llllY}
 \toprule
-Stack & Service & Description \\
+Stack & Service & Nodes & Repl. & Description \\
 \midrule
-basic  & \svc{frontend}    & nginx, the only public service (80/443), proxies by subdomain \\
-       & \svc{letsencrypt} & certbot, gets and renews one certificate for all subdomains \\
-       & \svc{registry}    & Docker registry with htpasswd authentication \\
-       & NFS               & NFSv4 server (port 2049), shared disk for the nodes \\
+basic  & \svc{frontend}    & front   & 2 & nginx: only public service (80/443), cache, TLS, proxy by subdomain \\
+       & \svc{letsencrypt} & front   & 1 & certbot; idle with a local domain (self-signed certificate) \\
+       & \svc{nfs}         & atenea  & 1 & NFSv4 server (NFS-Ganesha) inside the stack, port 2049 in host mode \\
 \midrule
-app    & \svc{core}        & Flask + gunicorn application \\
-       & \svc{static}      & Apache serving \texttt{/static/} \\
-       & \svc{db}          & PostgreSQL 16 (databases \texttt{app} and \texttt{grafana}) \\
-       & \svc{redis}       & cache of the average rating \\
-       & \svc{smtp}        & Postfix relaying the mails to an external provider \\
-       & \svc{auto}        & feeder: reads schema.org ratings of web pages \\
-       & \svc{backup}      & cron that dumps the databases and moodledata \\
+app    & \svc{core}        & app     & 2 & Flask + gunicorn, reviews \\
+       & \svc{static}      & app     & 2 & Apache httpd, \texttt{/static/} \\
+       & \svc{pg-1..3}    & app1, app2, stats & 3 & PostgreSQL 16 + Patroni (leader + 2 replicas) \\
+       & \svc{etcd-1..3}   & app1, app2, stats & 3 & consensus store of Patroni \\
+       & \svc{db}          & app     & 2 & HAProxy: \texttt{db:5432} leader, \texttt{db:5433} replicas \\
+       & \svc{redis-1}, \svc{redis-2} & app1, app2 & 1+1 & cache: master and replica \\
+       & \svc{sentinel-1..3} & app1, app2, stats & 3 & failover of the cache (quorum 2) \\
+       & \svc{smtp}        & app     & 2 & Postfix relaying the mails (to Mailpit by default) \\
+       & \svc{mailpit}     & app     & 1 & mail catcher with a web page (\texttt{mail.localhost:8080}) \\
+       & \svc{auto}        & app     & 1 & feeder of external ratings \\
+       & \svc{backup}      & backup  & 1 & encrypted dumps + restore test \\
 \midrule
-atenea & \svc{moodle}, \svc{moodle-cron} & Moodle 4.5 LTS (web and cron, same image) \\
-       & \svc{moodle-db}   & MariaDB 11.4 \\
+atenea & \svc{moodle}      & atenea  & 2 & Moodle 4.5.14 LTS \\
+       & \svc{moodle-cron} & atenea  & 1 & same image, \texttt{cron.php} every minute \\
+       & \svc{moodle-db}   & atenea  & 1 & MariaDB 11.4 \\
 \midrule
-stats  & \svc{grafana}     & dashboards, with the Infinity plugin (the ``?'') \\
-       & \svc{prometheus}, \svc{cadvisor} & metrics of the containers and the core app \\
+stats  & \svc{grafana}     & stats   & 2 & dashboards as code + Infinity plugin (the ``?'') \\
+       & \svc{prometheus}  & stats, backup & 2 & metrics and alert rules, one TSDB per replica \\
+       & exporters         & stats / global & --- & postgres, redis, mysqld, nginx, blackbox, node, cAdvisor \\
 \bottomrule
 \end{tabularx}
 \caption{Services of the infrastructure.}
 \label{tab:services}
 \end{table}
 
-Public names in production: \texttt{app.<domain>}, \texttt{lms.<domain>},
-\texttt{grafana.<domain>} and \texttt{registry.<domain>}. Locally the same names are used
-with \texttt{localhost} on port 8080 (browsers resolve \texttt{*.localhost} to 127.0.0.1).
+Public names in production: \texttt{app.<domain>}, \texttt{lms.<domain>} and
+\texttt{grafana.<domain>}; with the default \texttt{DOMAIN=localhost} they are
+\texttt{app.localhost}, \texttt{lms.localhost} and \texttt{grafana.localhost} on port 443. Locally the same names are used with \texttt{localhost} on port
+8080 (browsers resolve \texttt{*.localhost} to 127.0.0.1).
 
 \section{Images and design decisions}
 
-\paragraph{Frontend.} Based on \texttt{nginx:alpine}. We use the template feature of the
-official image (\texttt{envsubst} on startup) with two templates, local (http) and
-production (https), selected with \texttt{NGINX\_ENVSUBST\_TEMPLATE\_DIR}. Upstreams are
-resolved at request time through the Docker DNS, so nginx starts even if a backend is not
-running yet. nginx refuses to start without a certificate, so a small script creates a self
-signed one and switches to the Let's Encrypt one as soon as certbot gets it.
+\paragraph{Frontend and cache.} \texttt{nginx:alpine} with the template feature of the
+official image (two templates, local and production). Pages of the app are cached for 10~s
+in nginx (\texttt{proxy\_cache}, \texttt{proxy\_cache\_lock} and
+\texttt{proxy\_cache\_use\_stale}, so users still get an answer while the app is restarting);
+static files for one hour. A user that has just posted a review receives the cookie
+\texttt{posted} (10~s) which bypasses the cache, so everybody sees their own review at once.
+The footer at the bottom left of the page shows \emph{front: <node> / app: <node>}. The name of
+the node comes from the swarm template \texttt{\{\{.Node.Hostname\}\}}; the front node is
+requested by JavaScript to \texttt{/\_\_node} (not cached) because the HTML itself may be
+served from the cache. When the page is refreshed the routing mesh may hand the request to the
+other frontend replica and the footer changes.
 
-\paragraph{Let's Encrypt.} The official certbot image with a loop: \texttt{certbot certonly
---webroot --keep-until-expiring} every 12 hours, which issues the certificate the first time
-and renews it later. The challenge files are written in a volume shared with nginx.
+\paragraph{TLS on 443.} Production serves HTTPS on 443 with a \textbf{self-signed
+certificate} on \texttt{localhost}: nginx cannot start without a certificate, so the
+entrypoint generates one (key protected with the group passphrase \texttt{groupH},
+\texttt{CERT\_PASSWORD}, loaded with \texttt{ssl\_password\_file}) and the browser shows a
+warning that has to be accepted. The \svc{letsencrypt} service of the diagram is part of the
+stack and has the full logic (\texttt{certbot certonly --webroot}, retries, renewal and
+the switch of nginx without a restart), but with a local name it stays idle, because a
+certificate authority can only validate a public domain.
 
-\paragraph{Core app.} Python 3.12 slim, runs as a non-root user. It creates its tables on
-the first request, so there is no separate migration step. It exposes \texttt{/metrics} for
-Prometheus (blocked from outside in nginx) and \texttt{/api/stats} with JSON for Grafana.
-The page includes the average rating as JSON-LD (schema.org), the same format online shops
-use for search engines.
+\paragraph{Core application.} Python 3.12 slim, non-root, two replicas. The page shows the
+average, the distribution of ratings, a paginated list and a form with star rating; the
+average is also published as JSON-LD (schema.org), which the feeder reads. The data of each
+page is cached in Redis under a key that contains a version number: a new review increments
+the version, so stale entries are never read again. If Redis is down the page still works,
+because every cache call is inside \texttt{try/except}; if the database is not ready the
+answer is a clean 503. \texttt{/healthz} (liveness) and \texttt{/readyz} (database) are used
+by the healthchecks and by the probes. Writes go to \texttt{db:5432} (the PostgreSQL leader)
+and reads to \texttt{db:5433} (the replicas).
 
-\paragraph{Auto.} The feeder downloads the pages in \texttt{FEED\_URLS}, extracts the
-\texttt{aggregateRating} of the JSON-LD and posts it to \texttt{/api/ratings}, protected by
-a bearer token. By default it reads our own app, but any page with that markup works.
+\paragraph{PostgreSQL cluster (Patroni).} Three PostgreSQL 16 nodes (\svc{pg-1},
+\svc{pg-2}, \svc{pg-3}) on app1, app2 and stats, each managed by \textbf{Patroni} with a
+three-member \textbf{etcd} (\svc{etcd-1..3}, on the same nodes) as consensus store. Patroni
+initialises the first node, builds the others as streaming replicas
+(\texttt{pg\_basebackup}) and holds the leader key in etcd; if the leader disappears for
+\texttt{ttl} = 30~s a replica takes the key and is promoted, and the old leader is
+resynchronised with \texttt{pg\_rewind} when it comes back. Three nodes give a majority for
+etcd and for the election even if one node is lost, which two nodes could not.
+\svc{db} is HAProxy (two replicas): it asks the REST API of Patroni which node is the leader
+(\texttt{/primary}) and which are healthy replicas (\texttt{/replica}) and exposes one
+stable address, \texttt{db:5432} for the leader and \texttt{db:5433} for the replicas.
+Core, Grafana and the backups use only that name, so a failover needs no change anywhere.
+Tables and roles are created by the \texttt{post\_bootstrap} script of Patroni on the first
+node, not by the application, so several replicas of core starting together cannot collide.
+Patroni uses a \emph{fast} checkpoint for the base backup of a new replica, otherwise it
+waits for the spread checkpoint (minutes).
 
-\paragraph{SMTP.} Postfix on Alpine. It only accepts mail from the Docker networks and
-relays it to the provider configured in \texttt{.env} with SASL authentication and
-mandatory TLS. In the local environment it relays to mailpit, so the mails can be checked in
-the browser.
+\paragraph{Redis cluster.} \svc{redis-1} (master) and \svc{redis-2} (replica) with three
+Sentinels (app1, app2, stats; quorum~2). The application asks the Sentinels for the master
+(\texttt{redis.sentinel.Sentinel}), so after a failover it finds the new one by itself. The
+cache is optional: if Redis disappears the application keeps working, only slower.
 
-\paragraph{Moodle.} \texttt{php:8.3-apache} with the extensions Moodle needs and the 4.5 LTS
-release downloaded at build time. \texttt{config.php} reads the URL from the environment and
-the password from a Docker secret. The entrypoint waits for MariaDB and installs Moodle from
-the CLI the first time; to avoid two replicas installing at the same time, the one that
-manages to create a lock directory in the shared moodledata does it and the rest wait.
-\svc{moodle-cron} is the same image running \texttt{admin/cli/cron.php} every minute.
+\paragraph{Moodle.} \texttt{php:8.3-apache}, release \texttt{4.5.14} \emph{pinned} with its
+SHA-256: the file is downloaded with retries, verified and only then extracted, in its own
+layer. The entrypoint waits for MariaDB and installs Moodle from the CLI the first time. Only
+one container installs: a lock directory in the shared moodledata is the mutex and the
+installer touches a heartbeat file every 10~s; if the heartbeat is older than 90~s the
+installer died and another container takes the lock (atomic \texttt{mv}), empties the
+half-built schema and starts again. The installation is only trusted once the file
+\texttt{.installed} exists. Sessions are kept in the database, so any replica serves any
+user; \svc{moodle-cron} is the same image running \texttt{cron.php} in a loop.
 
-\paragraph{Grafana.} Configured as code: the datasources, the dashboard provider and the
-dashboard (JSON) are copied into the image, so the whole configuration is versioned in git.
-For the ``?'' we chose the \textbf{Infinity} datasource plugin, which turns any JSON, CSV or
-XML endpoint into a datasource. We use it to show the average rating and the ratings
-captured by the feeder directly from our API, without writing an exporter.
+\paragraph{NFS inside the stack.} A swarm service cannot be \texttt{privileged}, so instead
+of the kernel server we use \textbf{NFS-Ganesha} in user space, which only needs two
+capabilities (\texttt{DAC\_READ\_SEARCH}, \texttt{SYS\_RESOURCE}, \texttt{cap\_add} of the
+stack file) and no kernel module. It runs on the atenea node with a local volume and exports
+\texttt{moodledata}, \texttt{letsencrypt} and \texttt{acme} (NFSv4 only, port 2049). The port
+is published in \texttt{host} mode on that node only and the other nodes mount it at its
+private address (\texttt{NFS\_SERVER}); a task that starts before the server is retried by
+swarm.
+
+\paragraph{Backups and observability.} See Sections~\ref{sec:backup} and~\ref{sec:obs}.
+
+\paragraph{Scope of ``production''.} Production means the complete architecture, not
+a public service: it runs on our own computer (the seven nodes are simulated with
+Docker-in-Docker, Section~\ref{sec:verified}), it is not opened to the Internet and it has no
+public domain, so the certificate is self-signed and 443 is served on \texttt{localhost}. A
+deployment on a public server with a real domain would only need \texttt{DOMAIN} and
+\texttt{LE\_EMAIL}, and certbot would take over; that case is outside this project.
+
+\section{Scalability and high availability}
+
+\subsection{Replicas}
+
+The statement asks every service to be scalable, except cron jobs and DBMS. The stateless
+services run with two replicas (one per node) and can be scaled with
+\texttt{docker service scale}; Prometheus discovers new replicas with the DNS name
+\texttt{tasks.<service>}. The services with one replica are:
+\texttt{letsencrypt}, \texttt{backup}, \texttt{moodle-cron} and \texttt{auto} (periodic jobs:
+a second copy would only repeat the work), \texttt{moodle-db} (DBMS), \texttt{nfs} (the
+shared disk) and \texttt{mailpit} (a development tool). PostgreSQL and Redis are DBMS, and
+are clustered instead of scaled (leader and replicas).
+
+\subsection{Failures}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabularx}{\textwidth}{lYY}
+\toprule
+Failure & What happens & Recovery \\
+\midrule
+a front node & the routing mesh sends all the traffic to the other \svc{frontend} & automatic \\
+a core / static replica & swarm reschedules; nginx serves \texttt{stale} cached pages meanwhile & automatic \\
+Redis master & Sentinels promote the replica (\(\approx\)4 s on an idle machine; about 30 s when the host was overloaded, because Sentinel enters its \texttt{TILT} protection mode); the app keeps working, the cache is optional & automatic \\
+Postgres leader & Patroni elects a new leader among the two replicas and HAProxy follows it; writes fail only during the election (\(\approx\)3 s if the container is stopped, \(\approx\)28 s if it is killed, the \texttt{ttl} of the leader key) & automatic \\
+app node (slot 1) & one core left; pg-2 or pg-3 become leader, Redis replica is promoted, etcd keeps its majority (2 of 3) & automatic \\
+stats node & monitoring is down; pg-3 and etcd-3 leave but the quorum holds (2 of 3) & node back \\
+atenea node & Moodle, its database and the NFS (certs) are down; the app keeps working with the certificates it has loaded & node back, or restore from backup \\
+backup node & no new backups; nothing else & node back \\
+\bottomrule
+\end{tabularx}
+\caption{Failure scenarios.}
+\end{table}
+
+\subsection{Updates}
+
+Updates go one replica at a time (\texttt{stop-first}, \texttt{parallelism: 1}) with
+\texttt{failure\_action: rollback}, and are meaningful because the images we build have a
+\texttt{HEALTHCHECK}: a new replica must be healthy before the next one is replaced. The
+stateless services keep \emph{exactly one replica per node} (\texttt{max\_replicas\_per\_node:
+1}), so a node failure never takes both; with that restriction there is no free slot to
+start the new replica before stopping the old one, and the other replica serves meanwhile.
 
 \section{Deployment}
 
-\subsection{Cluster}
-
-We used three Ubuntu 24.04 virtual machines in the same private network, all of them swarm
-managers so the cluster keeps working if one node fails (quorum of 2 out of 3). Node~1 has
-the label \texttt{db=true} and also runs the NFS server. A wildcard DNS record
-\texttt{*.<domain>} points to the nodes; thanks to the routing mesh any node accepts the
-traffic and forwards it to a frontend replica.
-
+Local environment (one machine, no TLS):
 \begin{lstlisting}
-docker swarm init --advertise-addr 10.0.0.4      # node1, then join node2 and node3
-docker node update --label-add db=true node1
+docker compose pull && docker compose up -d
 \end{lstlisting}
 
-\subsection{Shared storage}
-
-The NFS server needs a privileged container and swarm services can not be privileged, so it
-is the only service started with plain Compose on the storage node
-(\texttt{basic/nfs/nfs.yml}). It exports \texttt{/srv/nfs} with NFSv4 only, restricted to
-the cluster subnet. In \texttt{production.yml} the shared volumes use the \texttt{local}
-driver with \texttt{type: nfs}, so Docker mounts them automatically on whatever node a task
-is scheduled. Nothing is mounted by hand on the hosts.
-
-\subsection{Compose files}
-
-\begin{itemize}
-\item \texttt{compose.yml}: local environment, no TLS, named volumes only, mailpit instead
-of a real mail provider.
-\item \texttt{production.yml}: the whole infrastructure for the swarm. It keeps the
-\texttt{build:} keys, so the same file is used to build and push the images
-(\texttt{docker stack deploy} ignores them).
-\end{itemize}
-
-\subsection{Steps}
-
+Production (seven nodes; \texttt{scripts/sim-swarm.sh up} does all this on one computer):
 \begin{lstlisting}
-set -a; . ./.env; set +a                # docker stack does not read .env
-docker compose -f production.yml build
-docker compose -f production.yml push
-docker stack deploy --with-registry-auth -c production.yml lab1
+# once: build and publish the images
+docker login && scripts/publish.sh
+
+# on a manager, after the 7 nodes joined the swarm
+scripts/label-nodes.sh                      # labels the nodes, prints the NFS_SERVER line
+export NFS_SERVER=<private IP of atenea>
+docker stack deploy -c production.yml lab1
 \end{lstlisting}
 
-The images are pulled from our registry at \texttt{127.0.0.1:5000}. This address works on
-every node because the registry port is published on the routing mesh, and Docker accepts
-plain HTTP for localhost. On the very first deployment the registry does not exist yet, so we
-deploy once (the registry starts and the other services wait), push the images and deploy
-again. \texttt{--with-registry-auth} forwards the registry login to the other nodes.
+All the images are in one public Docker Hub repository, \texttt{omarcornejo/lab1grouph},
+with one tag per service (\texttt{<service>-<version>}), so no registry has to be started
+before deploying.
 
-\section{Scalability}
+\section{Access, users and passwords}
 
-No service uses \texttt{container\_name}, fixed IPs or host ports other than the routing
-mesh, so all of them can run with several containers. Table~\ref{tab:scale} shows the
-replicas we use and why some are kept at one.
+All the passwords are Docker secrets, files of the \texttt{secrets/} folder, and all of them
+have the value \texttt{groupH}, a deliberate simplification of the laboratory (they would be
+changed before a real deployment). The only exception is the Moodle administrator, because
+Moodle refuses passwords that do not follow its policy (upper and lower case, digit and
+symbol).
 
-\begin{table}[h]
+\subsection{Web addresses}
+
+\begin{table}[ht]
 \centering\small
-\begin{tabularx}{\textwidth}{llX}
+\begin{tabularx}{\textwidth}{llYl}
 \toprule
-Service & Replicas & Reason \\
+Service & Local (\texttt{compose.yml}) & Production (\texttt{production.yml}) & Login \\
 \midrule
-\svc{core} & 3 & stateless, data in PostgreSQL and Redis \\
-\svc{frontend}, \svc{static}, \svc{smtp} & 2 & stateless \\
-\svc{registry} & 2 & storage on NFS, same \texttt{REGISTRY\_HTTP\_SECRET} \\
-\svc{moodle} & 2 & moodledata on NFS, sessions in the database \\
-\svc{grafana} & 2 & its state is in PostgreSQL, not in a local SQLite \\
-\svc{cadvisor} & global & one per node \\
-\svc{db}, \svc{moodle-db} & 1 & DBMS without automatic scaling \\
-\svc{redis}, \svc{prometheus} & 1 & in-memory cache / local time series database \\
-\svc{letsencrypt}, \svc{backup}, \svc{moodle-cron}, \svc{auto} & 1 & periodic jobs \\
+Reviews application & \texttt{http://app.localhost:8080} & \texttt{https://app.localhost} & none \\
+Moodle (Atenea) & \texttt{http://lms.localhost:8080} & \texttt{https://lms.localhost} & yes \\
+Grafana & \texttt{http://grafana.localhost:8080} & \texttt{https://grafana.localhost} & yes \\
+Mailpit (captured mails) & \texttt{http://mail.localhost:8080} & \texttt{http://mail.localhost:8080} & none \\
 \bottomrule
 \end{tabularx}
-\caption{Replicas per service.}
-\label{tab:scale}
+\caption{Web addresses. In production the certificate is self-signed, so the browser shows
+a warning that has to be accepted; port 80 redirects to 443.}
 \end{table}
 
-Updates use \texttt{order: start-first} and \texttt{failure\_action: rollback}, so a new
-version only replaces the old one if it starts correctly. Prometheus discovers the replicas
-of the core app with the DNS name \texttt{tasks.core}, so after
-\texttt{docker service scale lab1\_core=5} the new containers appear in Grafana without
-changes. The footer of the app shows the container that answered, which makes the load
-balancing easy to see.
+Prometheus, Patroni, etcd, HAProxy and the exporters are not published: they are reached
+from inside the stack (for example, \texttt{docker exec} on the container).
+
+\subsection{Users and passwords}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabularx}{\textwidth}{lllY}
+\toprule
+Service & User & Password & Secret file / note \\
+\midrule
+Grafana & \texttt{admin} & \texttt{groupH} & \texttt{grafana\_admin\_password} \\
+Moodle & \texttt{admin} & \texttt{groupH-2026} & \texttt{moodle\_admin\_password} \\
+PostgreSQL, administrator & \texttt{postgres} & \texttt{groupH} & \texttt{pg\_admin\_password}; used only by Patroni \\
+PostgreSQL, application & \texttt{app} & \texttt{groupH} & \texttt{app\_db\_password}; owner of database \texttt{app} \\
+PostgreSQL, Grafana & \texttt{grafana} & \texttt{groupH} & \texttt{grafana\_db\_password}; owner of database \texttt{grafana} \\
+PostgreSQL, replication & \texttt{replicator} & \texttt{groupH} & \texttt{replicator\_password} \\
+PostgreSQL, backups & \texttt{backup} & \texttt{groupH} & \texttt{backup\_db\_password}; read only \\
+PostgreSQL, monitoring & \texttt{exporter} & \texttt{groupH} & \texttt{exporter\_db\_password}; \texttt{pg\_monitor} \\
+MariaDB (Moodle) & \texttt{moodle} & \texttt{groupH} & \texttt{moodle\_db\_password} \\
+MariaDB, backups / monitoring & \texttt{backup}, \texttt{exporter} & \texttt{groupH} & same secrets as in PostgreSQL; read only \\
+Backup encryption & --- & \texttt{groupH} & \texttt{backup\_passphrase} (AES-256) \\
+Self-signed TLS key & --- & \texttt{groupH} & variable \texttt{CERT\_PASSWORD} \\
+Feeder token (\texttt{/api/ratings}) & --- & \texttt{groupH} & \texttt{feed\_token}, bearer token \\
+Docker Hub (pull) & --- & --- & public repository, no credentials \\
+\bottomrule
+\end{tabularx}
+\caption{Users and passwords of the project.}
+\end{table}
+
+The reviews application needs no login: anybody can read and write reviews. In both
+environments the notification mails go to Mailpit, a mail catcher with a web page, so they
+can be read without any external provider. To send real mail, \texttt{RELAY\_HOST},
+\texttt{RELAY\_PORT}, \texttt{RELAY\_USER}, \texttt{RELAY\_PASSWORD} and \texttt{SMTP\_TLS}
+point the relay to a provider.
 
 \section{Data management and backups}
+\label{sec:backup}
 
-\begin{table}[h]
+\begin{table}[ht]
 \centering\small
 \begin{tabular}{lll}
 \toprule
 Data & Volume & Location \\
 \midrule
-PostgreSQL, MariaDB, Prometheus & \texttt{db}, \texttt{moodle-db}, \texttt{prometheus} & local disk of node 1 \\
-moodledata & \texttt{moodledata} & NFS \\
-certificates, ACME challenges & \texttt{certs}, \texttt{acme} & NFS \\
-registry images & \texttt{registry} & NFS \\
-backups & \texttt{backups} & NFS \\
-Redis & none & memory only (cache) \\
+PostgreSQL (3 nodes), etcd & \texttt{pg-1..3}, \texttt{etcd-1..3} & local disk of app1, app2, stats \\
+MariaDB, NFS data & \texttt{moodle-db}, \texttt{nfs-data} & local disk of atenea \\
+moodledata, certificates & \texttt{moodledata}, \texttt{certs}, \texttt{acme} & NFS (atenea) \\
+backups & \texttt{backups} & local disk of the \textbf{backup} node \\
+Prometheus (2 replicas) & anonymous volume of each task & local disk of stats and backup \\
+Redis & none & memory (cache, replicated) \\
 \bottomrule
 \end{tabular}
 \caption{Where the data is stored.}
 \end{table}
 
-We decided not to put the databases on NFS: database engines on network filesystems risk
-corruption with locking problems or network cuts, and they are slow. They are pinned with a
-placement constraint to the node labelled \texttt{db=true} and use local volumes; what goes
-to the shared disk are the dumps.
-
-The \svc{backup} service is an Alpine image with \texttt{crond}. Every night at 03:30 it
-creates a folder in the backup volume with:
+Databases are not on NFS (locking and network cuts risk corruption). The backup service
+lives on a node that is neither an app node nor the NFS node, with its own disk, so no live
+data shares a node with its backup. Every night (03:30) it creates a folder with
 \begin{itemize}
-\item \texttt{app.dump} and \texttt{grafana.dump}: \texttt{pg\_dump -Fc} (custom format,
-allows restoring single tables);
-\item \texttt{moodle.sql.gz}: \texttt{mariadb-dump --single-transaction}, consistent
-without locking the tables;
-\item \texttt{moodledata.tar.gz}: moodledata without caches, sessions and temporary files.
+\item \texttt{app.dump.enc}, \texttt{grafana.dump.enc}: \texttt{pg\_dump -Fc} from the
+\emph{replicas} (\texttt{db:5433}, no load on the leader; falls back to the leader), as the read-only role
+\texttt{backup};
+\item \texttt{moodle.sql.gz.enc}: \texttt{mariadb-dump --single-transaction} with a read-only
+MariaDB account;
+\item \texttt{moodledata.tar.gz.enc}: moodledata without caches and sessions;
+\item \texttt{SHA256SUMS}.
 \end{itemize}
-Folders older than 14 days are deleted. A backup can be launched by hand with
-\texttt{docker exec <backup container> /backup.sh}. Restoring, from node 1:
+Every file is encrypted with AES-256-CBC, PBKDF2 (\texttt{openssl enc}) and the passphrase
+of a Docker secret. The folder is written as \texttt{.partial} and renamed at the end, so an
+interrupted backup is never mistaken for a good one. Folders older than 14 days are removed.
 
-\begin{lstlisting}
-docker exec -i <db container> pg_restore -U app -d app --clean < /srv/nfs/backups/<date>/app.dump
-gunzip -c /srv/nfs/backups/<date>/moodle.sql.gz | docker exec -i <moodle-db container> \
-  sh -c 'mariadb -u moodle -p"$(cat /run/secrets/moodle_db_password)" moodle'
-tar -xzf /srv/nfs/backups/<date>/moodledata.tar.gz -C /srv/nfs/moodledata
-\end{lstlisting}
+\paragraph{Automatic restore test.} Every Sunday (and on demand with
+\texttt{docker exec <backup> /restore-test.sh}) the latest backup is verified: checksums,
+decryption, restoration of the application dump into a throw-away PostgreSQL started inside
+the container and of the Moodle dump into a throw-away MariaDB, and a count of rows and
+tables. The result is published as metrics (\texttt{backup\_restore\_test\_ok}, rows,
+tables) that Prometheus scrapes, with alerts if the last backup is older than 25~h or the
+test fails. The result is the number of reviews and of Moodle tables recovered.
 
-The main limitation is that the backups are on the same server as the shared data. For a
-real deployment we would copy them off-site (for example with restic to object storage) and
-encrypt them. Also, if node~1 fails, the databases stop until they are restored on another
-node from the last dump.
+Restoring: \texttt{scripts/restore.sh <folder> app|grafana|moodle|moodledata}.
+
+\section{Observability}
+\label{sec:obs}
+
+Prometheus uses DNS service discovery (\texttt{tasks.<service>}) so scaled replicas are
+scraped without changes. Table~\ref{tab:obs} lists the sources.
+
+\begin{table}[ht]
+\centering\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.6cm}>{\raggedright\arraybackslash}p{3.6cm}Y@{}}
+\toprule
+Source & Watches & What we look at \\
+\midrule
+\texttt{core} & the application & requests per replica; reviews posted; cache hits and misses \\
+nginx exporter (inside the frontend image) & each frontend replica & requests per second; active connections \\
+postgres\_exporter (one per node) and Patroni & the three PostgreSQL nodes & connections; transactions; replication lag; which node is the leader \\
+redis\_exporter & Redis master and replica & role; connected replicas; hit ratio; memory \\
+mysqld\_exporter & MariaDB of Moodle & connected threads; queries per second \\
+blackbox\_exporter & frontend, core, static, Moodle and Grafana & availability and response time as a user sees them (this is how Moodle is monitored) \\
+cAdvisor and node\_exporter & every node & CPU and memory per service and per host \\
+backup service (port 9199) & the backup node & age, size and duration of the last backup; result of the restore test \\
+\bottomrule
+\end{tabularx}
+\caption{Metric sources.}
+\label{tab:obs}
+\end{table}
+
+The dashboard (as code, in git) has rows for overview, containers, nginx, PostgreSQL,
+Redis, MariaDB/Moodle and backups; the queries use \texttt{label\_replace} so the same panel
+works with the swarm and the compose labels of cAdvisor. The Infinity datasource (the ``?'') shows the average and the ratings captured by
+the feeder straight from \texttt{/api/stats}. Rules in \texttt{rules.yml}: target or site
+down, replication lag, Postgres or Redis without exactly one leader/master, old backup, failed restore test.
+Moodle, which has no metrics endpoint, is covered by the probe of its login page and by the
+MariaDB exporter, which draws the arrow Grafana$\to$atenea of the diagram.
 
 \section{Security}
 
 \begin{itemize}
-\item Only nginx is exposed; port 80 only serves ACME challenges and redirects to HTTPS
-(TLS 1.2/1.3 and HSTS).
-\item Passwords are Docker secrets mounted in \texttt{/run/secrets}, never written in the
-compose files; the \texttt{secrets/} folder is ignored by git.
-\item The overlay networks \texttt{proxy}, \texttt{app} and \texttt{atenea} are encrypted
-(IPsec between nodes), and each stack is isolated in its own network.
-\item The SMTP relay is not published and only accepts mail from the internal networks.
-\item The registry requires authentication (bcrypt htpasswd) and \texttt{/metrics} is not
-reachable from outside.
+\item Only nginx is exposed; port 80 serves ACME challenges and redirects to HTTPS
+(TLS 1.2/1.3, HSTS). Moodle, Grafana and the app are reached only through it.
+\item \textbf{Database roles with least privilege}: \texttt{app} owns database
+\texttt{app} and \texttt{grafana} owns its own; \texttt{replicator} (created by Patroni) can only replicate;
+\texttt{backup} has \texttt{pg\_read\_all\_data}; \texttt{exporter} has \texttt{pg\_monitor};
+nobody uses the superuser, and \texttt{CONNECT} is revoked from \texttt{PUBLIC}. MariaDB has
+separate read-only \texttt{exporter} and \texttt{backup} accounts.
+\item Passwords are Docker secrets mounted in \texttt{/run/secrets}. All overlay networks
+are encrypted (IPsec) and each stack is isolated in its own network.
+\item The SMTP relay is not published; \texttt{/metrics} is blocked in nginx. The only
+other published page is the mail catcher (\texttt{mail.localhost:8080}), plain HTTP and
+without login, which is acceptable in the laboratory because it only holds notification mails.
+\item Backups are encrypted and verified.
 \end{itemize}
-Known weak points: ports published by Docker skip the host firewall (ufw), so the registry
-port 5000 must be closed in the cloud provider firewall; and the NFS export uses
-\texttt{no\_root\_squash} because some containers write as root, which we limited to the
-cluster subnet.
+\section{Test cases}
+
+Each case says what to do, where to look and what must be seen. Commands are run from the
+project folder (local environment) or on the manager node, \texttt{front1} (production,
+\texttt{docker exec front1 \ldots}).
+
+\subsection{Local environment}
+
+\begin{footnotesize}
+\begin{longtable}{@{}p{0.7cm}>{\raggedright\arraybackslash}p{3.5cm}>{\raggedright\arraybackslash}p{5.4cm}>{\raggedright\arraybackslash}p{4.8cm}@{}}
+\caption{Test cases of the local environment.}\\
+\toprule
+ & What we do & Where we look & Expected \\
+\midrule
+\endfirsthead
+\toprule
+ & What we do & Where we look & Expected \\
+\midrule
+\endhead
+L1 & Publish a review in \texttt{app.localhost:8080} & \texttt{docker compose logs core | grep "POST /comment"} & status \texttt{302}; the review appears at the top and the counter grows \\
+L2 & (same review) & \texttt{docker compose logs smtp | grep status=sent}; page \texttt{mail.localhost:8080} & \texttt{status=sent}, and the mail ``New review (n/5)'' is listed \\
+L3 & Create a course in Atenea as \texttt{admin} (Site administration $\to$ Courses) & \texttt{docker compose logs moodle | grep "POST /course/edit.php"}; \texttt{docker compose exec moodle-db mariadb -umoodle -pgroupH moodle -e "select shortname from mdl\_course"} & \texttt{303}; the course is in the table \\
+L4 & Stop the Postgres leader: \texttt{docker compose kill pg-1} (the leader) & \texttt{docker compose exec pg-2 patronictl -c /etc/patroni.yml list}; \texttt{docker compose logs pg-2 | grep promoted} & another node is \emph{Leader}; ``promoted self to leader''; a new review is still accepted \\
+L5 & Stop the Redis master: \texttt{docker compose stop redis-1} & \texttt{docker compose logs sentinel | grep switch-master} & \texttt{+switch-master mymaster redis-1 6379 redis-2 6379}; the page keeps working \\
+L6 & Backup and restore test & \texttt{docker compose exec backup /backup.sh}; \texttt{docker compose exec backup /restore-test.sh} & \texttt{backup ok: /backups/\ldots}; \texttt{restore test ok: n comments, 494 moodle tables} \\
+L7 & More replicas: \texttt{docker compose up -d --scale core=3} & several requests; header \texttt{X-App-Node} & the node name changes between requests \\
+L8 & Open Grafana, dashboard \emph{Lab1} & panels of PostgreSQL, Redis, nginx, backups & data in every panel; one Patroni node with value 1 \\
+\bottomrule
+\end{longtable}
+\end{footnotesize}
+
+\subsection{Production environment}
+
+\begin{footnotesize}
+\begin{longtable}{@{}p{0.7cm}>{\raggedright\arraybackslash}p{3.5cm}>{\raggedright\arraybackslash}p{5.4cm}>{\raggedright\arraybackslash}p{4.8cm}@{}}
+\caption{Test cases of the production environment.}\\
+\toprule
+ & What we do & Where we look & Expected \\
+\midrule
+\endfirsthead
+\toprule
+ & What we do & Where we look & Expected \\
+\midrule
+\endhead
+P1 & Deploy the stack & \texttt{docker node ls}; \texttt{docker service ls}; \texttt{docker stack ps lab1} & 7 nodes \emph{Ready}; every service at its replicas; each task on its node \\
+P2 & Open \texttt{https://app.localhost} & browser; \texttt{curl -k -D- https://app.localhost/} & the page loads after accepting the certificate; \texttt{X-Front-Node} and \texttt{X-App-Node} alternate between requests \\
+P3 & Publish a review & \texttt{docker service logs lab1\_core | grep "POST /comment"} & \texttt{POST /comment ... 302} on one of the two core replicas \\
+P4 & (same review) & \texttt{http://mail.localhost:8080}; \texttt{docker service logs lab1\_smtp | grep status=sent} & the mail is listed; \texttt{relay=mailpit[...]:1025 ... status=sent} \\
+P5 & Create a course in Atenea & \texttt{https://lms.localhost}; \texttt{docker service logs lab1\_moodle | grep course/edit.php}; table \texttt{mdl\_course} in the \texttt{lab1\_moodle-db} container & \texttt{POST /course/edit.php ... 303}; new row (for example \texttt{PRUEBA1}) \\
+P6 & Lose a whole node: \texttt{docker stop app2} & \texttt{docker node ls}; \texttt{patronictl list}; \texttt{curl -k https://app.localhost/} & \texttt{app2} \emph{Down} in $\approx$13~s; a replica becomes leader; the page answers 200 and a new review is accepted after the election (at most the 30~s \texttt{ttl}) \\
+P7 & Kill the Postgres leader container: \texttt{docker kill <pg-N container>} & \texttt{docker service logs lab1\_pg-N | grep promoted}; \texttt{patronictl list} & ``promoted self to leader because I had the session lock''; timeline (TL) grows by one; swarm restarts the container as a replica; no review is lost \\
+P8 & Kill the Redis master container & \texttt{docker service logs lab1\_sentinel-1 | grep switch-master} & \texttt{+switch-master mymaster redis-1 6379 redis-2 6379} in about 2~s; the page keeps working \\
+P9 & Rolling update: \texttt{docker service update --force lab1\_frontend} & a request every half second to \texttt{https://app.localhost/} & replicas replaced one by one; no request fails \\
+P10 & Backup on the backup node & \texttt{docker exec <lab1\_backup container> /backup.sh} and \texttt{/restore-test.sh} & \texttt{backup ok ... source: db:5433}; \texttt{restore test ok} \\
+P11 & Restore the application database from a backup & write a review after the backup, then \texttt{scripts/restore.sh <folder> app} on the backup node; count the reviews & the review written after the backup disappears and the earlier ones are back; the tables keep their owner and the application keeps working \\
+P12 & Open Grafana & \texttt{https://grafana.localhost}, dashboard \emph{Lab1}; Prometheus on the stats and backup nodes & 36 targets \emph{UP} in each Prometheus; panels with data \\
+\bottomrule
+\end{longtable}
+\end{footnotesize}
+
+\section{Results}
+
+\subsection{Local environment}
+
+The whole stack starts with two commands (\texttt{docker compose pull} and
+\texttt{docker compose up -d}) and in less than a minute the 29 containers are healthy
+(Moodle needs about three minutes the first time, because it installs itself). The
+application works end to end: a review is stored in PostgreSQL, appears at once on the page,
+generates a mail that can be read in Mailpit, and updates the dashboards of Grafana. The
+database and the cache survive the loss of their main node: stopping the PostgreSQL leader
+makes another node take its place in a few seconds (about 3~s if the container is stopped,
+about 28~s if it is killed), and stopping the Redis master promotes its replica; in both
+cases the application keeps accepting reviews and no review is lost. The backup is encrypted
+and the automatic restore test recovers the reviews and the 494 tables of Moodle.
+
+\subsection{Production environment (\texttt{production.yml})}
+\label{sec:verified}
+
+Production is the same stack spread over seven nodes. It runs on our own computer: the nodes
+are seven Docker-in-Docker containers (\texttt{scripts/sim-swarm.sh}), three of them swarm
+managers. All the services
+reach their replicas and each one is on the node that its label asks for. What we obtained:
+\begin{itemize}
+\item \textbf{Entry:} the three sites answer on 443 through both front nodes (self-signed
+certificate) and port 80 redirects; requests are spread over front1/front2 and app1/app2.
+\item \textbf{Loss of a whole node (app2):} swarm detects it in 13~s, a database replica is
+promoted, the page keeps answering and reviews are accepted again once the election ends;
+when the node returns, its database rejoins as a replica without intervention.
+\item \textbf{Loss of a front node:} the other front serves all the sites.
+\item \textbf{Rolling update:} the frontend was replaced replica by replica while a request
+was sent every half second, and none failed.
+\item \textbf{Mail, Atenea and Grafana:} the mail of a new review is listed in
+\texttt{http://mail.localhost:8080}, a course created in Atenea is stored (log and database)
+and both Prometheus replicas see all their targets up.
+\item \textbf{Backups:} made from a database replica on the backup node, encrypted, and the
+restore test passes (reviews and 494 Moodle tables).
+\end{itemize}
+\section{Limitations}
+
+\begin{itemize}
+\item \textbf{Production is simulated on one computer.} The seven nodes are
+Docker-in-Docker containers, so the behaviour with the latency of separate machines is not
+measured. It is not opened to the Internet and has no public domain: the certificate is
+self-signed (the Let's Encrypt logic is in the stack but stays idle).
+\item \textbf{Quorum.} PostgreSQL and etcd need two of their three nodes; if two fail at the
+same time, writes stop until one returns. The third PostgreSQL node shares its machine with
+the monitoring.
+\item \textbf{Single instances.} MariaDB, the NFS server and the mail catcher have one
+instance (the statement exempts DBMS); losing the atenea node stops Moodle until it returns.
+\item \textbf{Backups} are kept on one disk of one node; there is no off-site copy.
+\item \textbf{Security simplifications of the laboratory.} All the secrets are
+\texttt{groupH} and are committed; NFS uses \texttt{no\_root\_squash} (limited to private
+networks) and its port must be closed in a firewall; the mail catcher has no login.
+\end{itemize}
 
 \section{Conclusions}
 
-The whole infrastructure is deployed with one command per step (build, push, deploy) and
-every service can run on any node, except the databases, which we pinned on purpose. The
-part that took the most time was Moodle (installation with several replicas and the shared
-moodledata) and making nginx start before the real certificate existed.
+The goal of the project was to turn the infrastructure of a company into a set of small
+services that can be started anywhere with a couple of commands, and to prove that it keeps
+working when something breaks. We have a complete system: a reviews application, a learning
+platform, monitoring, mail and backups, all packaged as images that anyone can download and
+run, on one machine for development or on seven nodes for production.
+
+The part that taught us most was not starting the services but making them survive failures.
+In a distributed system the pieces have to find each other, agree on who is in charge and
+recover without anybody touching them, and many of the problems we found appeared only when
+we switched machines off on purpose. Testing those failures from the beginning, and not at
+the end, saved us from believing that something worked just because it had started.
+
+The result is a system where losing a web server, an application server, the cache or the
+database leader goes unnoticed by the user, and where the data is protected by encrypted
+copies that are checked automatically by restoring them. It is not a public service and it
+keeps some simplifications that a real company would not accept, which are listed in the
+previous section, but the structure is the same one that would be used with real machines:
+the next steps would be to move it to servers with a real domain, to keep a copy of the
+backups outside, and to manage the passwords properly.
 
 \subsection*{Work distribution}
-\begin{tabularx}{\textwidth}{lX}
-Member 1 & basic stack: frontend, Let's Encrypt, registry, NFS \\
-Member 2 & core app, static files, Redis \\
-Member 3 & databases, SMTP relay, feeder, backups \\
-Member 4 & Atenea (Moodle and MariaDB) \\
-Member 5 & stats stack and swarm cluster \\
+\begin{tabularx}{\textwidth}{lY}
+Member 1 & basic stack: frontend, cache, Let's Encrypt, NFS \\
+Member 2 & core app and interface, static files, Redis cluster \\
+Member 3 & PostgreSQL cluster (Patroni) and roles, SMTP relay, feeder, backups \\
+Member 4 & Atenea (Moodle, MariaDB) \\
+Member 5 & stats stack, exporters, swarm cluster and documentation \\
 \end{tabularx}
 
 \end{document}

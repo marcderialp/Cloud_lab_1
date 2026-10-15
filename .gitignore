@@ -1,2 +1,31 @@
+# local overrides (the lab secrets in secrets/ are committed on purpose, see README)
 .env
-secrets/
+
+# LaTeX build files: only docs/report.tex and docs/report.pdf are kept
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.bbl
+*.blg
+*.nav
+*.snm
+*.vrb
+*.synctex.gz
+*.synctex(busy)
+
+# python
+__pycache__/
+*.pyc
+
+# editors and operating system
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

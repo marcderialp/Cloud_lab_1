@@ -1,6 +1,6 @@
 """Core app: a page where people leave reviews with a 1-5 rating.
-Postgres for the data, redis to cache the average, mails through the smtp
-service, /api/ratings for the auto feeder and /metrics for prometheus."""
+Postgres for the data (Patroni cluster behind haproxy), redis behind sentinel for the cache, mails through the smtp service,
+/api/ratings for the auto feeder and /metrics for prometheus."""
 import json
 import os
 import smtplib
@@ -11,6 +11,10 @@ import psycopg
 import redis
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
+from redis.sentinel import Sentinel
+
+PER_PAGE = 5
+NODE = os.environ.get("NODE") or socket.gethostname()
 
 
 def secret(name):
@@ -19,74 +23,142 @@ def secret(name):
     return open(path).read().strip() if path else os.environ.get(name, "")
 
 
-DB = dict(host="db", dbname="app", user="app", password=secret("DB_PASSWORD"))
-cache = redis.Redis(host="redis", socket_timeout=2)
+# "db" is haproxy: :5432 is always the Patroni leader (after a failover too),
+# :5433 are the replicas. Reads try the replicas first and fall back to the leader.
+_H = os.environ.get("DB_HOST", "db")
+_BASE = (f"dbname=app user={os.environ.get('DB_USER', 'app')} "
+         f"password={secret('DB_PASSWORD')} connect_timeout=3")
+_WRITE = f"host={_H} port=5432 {_BASE}"
+_READ = f"host={_H},{_H} port=5433,5432 {_BASE}"
+
+_SENTINELS = [(h, 26379) for h in os.environ.get("REDIS_SENTINELS", "").split(",") if h]
+if _SENTINELS:
+    cache = Sentinel(_SENTINELS, socket_timeout=1).master_for(
+        os.environ.get("REDIS_MASTER", "mymaster"), socket_timeout=1, decode_responses=True)
+else:
+    cache = redis.Redis(host=os.environ.get("REDIS_HOST", "redis"), socket_timeout=1,
+                        decode_responses=True)
+
 REQUESTS = Counter("core_requests_total", "HTTP requests", ["endpoint"])
 COMMENTS = Counter("core_comments_total", "Comments posted")
+CACHE = Counter("core_cache_total", "Page cache lookups", ["result"])
 app = Flask(__name__)
-ready = False
 
 
-def db():
-    return psycopg.connect(**DB, autocommit=True, connect_timeout=5)
+def db(read_only=False):
+    return psycopg.connect(_READ if read_only else _WRITE, autocommit=True)
+
+
+def cache_version():
+    # every write bumps the version, so old entries are never read again
+    try:
+        return int(cache.get("ver") or 0)
+    except redis.RedisError:
+        return 0
+
+
+def cache_get(key):
+    try:
+        hit = cache.get(key)
+        return json.loads(hit) if hit is not None else None
+    except redis.RedisError:
+        return None
+
+
+def cache_set(key, value, ttl=30):
+    try:
+        cache.setex(key, ttl, json.dumps(value))
+    except redis.RedisError:
+        pass
 
 
 @app.before_request
-def init():
-    global ready
-    REQUESTS.labels(request.endpoint or "none").inc()
-    if not ready and request.endpoint != "metrics":
-        try:
-            with db() as conn:
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS comments (
-                        id SERIAL PRIMARY KEY, author TEXT, body TEXT,
-                        rating INT CHECK (rating BETWEEN 1 AND 5),
-                        created TIMESTAMPTZ DEFAULT now());
-                    CREATE TABLE IF NOT EXISTS external_ratings (
-                        id SERIAL PRIMARY KEY, url TEXT, rating REAL,
-                        captured TIMESTAMPTZ DEFAULT now());""")
-            ready = True
-        except psycopg.OperationalError:
-            return "database not ready", 503
+def count():
+    if request.endpoint not in ("healthz", "metrics"):
+        REQUESTS.labels(request.endpoint or "none").inc()
 
 
-def average():
+@app.after_request
+def headers(resp):
+    resp.headers["X-App-Node"] = NODE
+    return resp
+
+
+def summary(read_only=False):
+    """(average, total, {rating: count}) cached in redis."""
+    key = f"summary:{cache_version()}"
+    if (hit := cache_get(key)) is not None:
+        CACHE.labels("hit").inc()
+        return hit
+    CACHE.labels("miss").inc()
+    with db(read_only) as conn:
+        avg, total = conn.execute(
+            "SELECT round(avg(rating), 2)::float, count(*) FROM comments").fetchone()
+        dist = dict(conn.execute(
+            "SELECT rating::text, count(*) FROM comments GROUP BY rating").fetchall())
+    out = [avg, total, dist]
+    cache_set(key, out)
+    return out
+
+
+def reviews(page):
+    key = f"reviews:{cache_version()}:{page}"
+    if (hit := cache_get(key)) is not None:
+        return hit
+    with db() as conn:  # primary: the user must see what has just written
+        rows = conn.execute(
+            "SELECT author, body, rating, to_char(created, 'YYYY-MM-DD HH24:MI') "
+            "FROM comments ORDER BY id DESC LIMIT %s OFFSET %s",
+            (PER_PAGE, (page - 1) * PER_PAGE)).fetchall()
+    cache_set(key, rows)
+    return rows
+
+
+@app.errorhandler(psycopg.OperationalError)
+def database_unavailable(e):
+    # at a cold start or during a failover: a clean 503, not a traceback
+    app.logger.warning("database unavailable: %s", str(e).strip().splitlines()[0] if str(e).strip() else e)
+    return "database not ready", 503
+
+
+@app.get("/healthz")
+def healthz():
+    return "ok"
+
+
+@app.get("/readyz")
+def readyz():
     try:
-        if (hit := cache.get("avg")) is not None:
-            return json.loads(hit)
-    except redis.RedisError:
-        pass
-    with db() as conn:
-        row = conn.execute("SELECT round(avg(rating), 2)::float, count(*) FROM comments").fetchone()
-    try:
-        cache.setex("avg", 30, json.dumps(row))
-    except redis.RedisError:
-        pass
-    return row
+        with db() as conn:
+            conn.execute("SELECT 1")
+        return "ready"
+    except psycopg.Error:
+        return "database not ready", 503
 
 
 @app.get("/")
 def index():
-    with db() as conn:
-        comments = conn.execute(
-            "SELECT author, body, rating FROM comments ORDER BY id DESC LIMIT 20").fetchall()
-    avg, total = average()
-    return render_template("index.html", comments=comments, avg=avg, total=total,
-                           host=socket.gethostname())
+    page = max(1, request.args.get("page", 1, type=int))
+    avg, total, dist = summary()
+    pages = max(1, -(-total // PER_PAGE))
+    return render_template("index.html", comments=reviews(page), avg=avg, total=total,
+                           dist=dist, page=page, pages=pages, node=NODE)
 
 
 @app.post("/comment")
 def comment():
-    author = request.form.get("author", "")[:60]
-    body = request.form.get("body", "")[:1000]
+    author = request.form.get("author", "").strip()[:60]
+    body = request.form.get("body", "").strip()[:1000]
     rating = request.form.get("rating", type=int)
     if not author or not body or rating not in range(1, 6):
         abort(400)
     with db() as conn:
         conn.execute("INSERT INTO comments (author, body, rating) VALUES (%s, %s, %s)",
                      (author, body, rating))
-    cache.delete("avg")
+    try:
+        cache.incr("ver")
+    except redis.RedisError as e:
+        app.logger.warning("cache not invalidated: %s", e)
     COMMENTS.inc()
     try:
         msg = EmailMessage()
@@ -96,7 +168,10 @@ def comment():
             s.send_message(msg)
     except Exception as e:
         app.logger.warning("mail not sent: %s", e)
-    return redirect("/")
+    resp = redirect("/")
+    # the front cache skips its copy of "/" for this user while the cookie lives
+    resp.set_cookie("posted", "1", max_age=10)
+    return resp
 
 
 @app.post("/api/ratings")
@@ -112,12 +187,18 @@ def api_ratings():
 
 @app.get("/api/stats")
 def api_stats():
-    with db() as conn:
+    with db(read_only=True) as conn:
         ext = conn.execute("SELECT DISTINCT ON (url) url, rating, captured::text "
                            "FROM external_ratings ORDER BY url, captured DESC").fetchall()
-    avg, total = average()
+        # the last 100 captures, oldest first (ISO times: Grafana plots them as a series)
+        hist = conn.execute(
+            "SELECT url, rating, to_char(captured AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') "
+            "FROM (SELECT * FROM external_ratings ORDER BY captured DESC LIMIT 100) t "
+            "ORDER BY captured").fetchall()
+    avg, total, _ = summary(read_only=True)
     return jsonify(average=avg, comments=total,
-                   external=[dict(url=u, rating=r, captured=c) for u, r, c in ext])
+                   external=[dict(url=u, rating=r, captured=c) for u, r, c in ext],
+                   history=[dict(url=u, rating=r, captured=c) for u, r, c in hist])
 
 
 @app.get("/metrics")

@@ -1,87 +1,192 @@
-# Local environment: docker compose up -d --build
+# Local environment: docker compose up -d   (images from Docker Hub, --build to build them)
 # No TLS, no NFS, only named volumes. Open http://app.localhost:8080,
 # lms.localhost:8080, grafana.localhost:8080 and mail.localhost:8080 (mailpit)
+# Scale the stateless services with: docker compose up -d --scale core=3
 
 x-moodle: &moodle
-  image: lab1/moodle
+  image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:moodle-${TAG:-1.0}
   environment: { MOODLE_URL: "http://lms.localhost:8080" }
   secrets: [ moodle_db_password, moodle_admin_password ]
   volumes: [ moodledata:/var/moodledata ]
 
 services:
+  # ---------- basic ----------
   frontend:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:frontend-${TAG:-1.0}
     build: ./basic/frontend
-    environment: { DOMAIN: localhost, NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates-local }
+    environment: { DOMAIN: localhost, NODE: "", NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates-local }
     ports: [ "8080:80" ]
 
+  # ---------- app ----------
   core:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:core-${TAG:-1.0}
     build: ./app/core
-    environment: { DB_PASSWORD_FILE: /run/secrets/db_password, FEED_TOKEN_FILE: /run/secrets/feed_token, NOTIFY_EMAIL: team@lab1.local }
-    secrets: [ db_password, feed_token ]
+    deploy: { replicas: 2 }
+    environment:
+      NODE: ""
+      DB_HOST: db
+      DB_USER: app
+      DB_PASSWORD_FILE: /run/secrets/app_db_password
+      FEED_TOKEN_FILE: /run/secrets/feed_token
+      REDIS_SENTINELS: sentinel
+      NOTIFY_EMAIL: team@lab1.local
+    secrets: [ app_db_password, feed_token ]
   static:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:static-${TAG:-1.0}
     build: ./app/static
+
+  # postgres: 3 Patroni nodes (leader election in etcd) behind haproxy ("db").
+  # etcd is a single member here; production has three.
+  etcd-1:
+    image: quay.io/coreos/etcd:v3.5.15
+    command: [ etcd, --name=etcd-1, --data-dir=/etcd-data, --listen-client-urls=http://0.0.0.0:2379,
+               --advertise-client-urls=http://etcd-1:2379, --listen-peer-urls=http://0.0.0.0:2380,
+               --initial-advertise-peer-urls=http://etcd-1:2380, --initial-cluster=etcd-1=http://etcd-1:2380,
+               --initial-cluster-token=lab1 ]
+    volumes: [ "etcd-1:/etcd-data" ]
+    healthcheck: { test: [ CMD, etcdctl, endpoint, health ], interval: 10s, timeout: 3s, retries: 5, start_period: 120s }
+  pg-1: &pg
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:postgres-${TAG:-1.0}
+    build: ./app/db
+    hostname: pg-1
+    environment: &pg-env { PATRONI_NAME: pg-1, ETCD_HOSTS: "etcd-1:2379" }
+    secrets: [ pg_admin_password, replicator_password, app_db_password, grafana_db_password, backup_db_password, exporter_db_password ]
+    volumes: [ "pg-1:/var/lib/postgresql/data" ]
+    depends_on: [ etcd-1 ]
+  pg-2:
+    <<: *pg
+    build: !reset null
+    pull_policy: never
+    hostname: pg-2
+    environment: { <<: *pg-env, PATRONI_NAME: pg-2 }
+    volumes: [ "pg-2:/var/lib/postgresql/data" ]
+    depends_on: [ pg-1 ]
+  pg-3:
+    <<: *pg
+    build: !reset null
+    pull_policy: never
+    hostname: pg-3
+    environment: { <<: *pg-env, PATRONI_NAME: pg-3 }
+    volumes: [ "pg-3:/var/lib/postgresql/data" ]
+    depends_on: [ pg-1 ]
   db:
-    image: postgres:16-alpine
-    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD_FILE: /run/secrets/db_password }
-    secrets: [ db_password ]
-    configs: [ { source: init_sql, target: /docker-entrypoint-initdb.d/init.sql } ]
-    volumes: [ db:/var/lib/postgresql/data ]
-  redis:
-    image: redis:7.4-alpine
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:haproxy-${TAG:-1.0}
+    build: ./app/haproxy
+
+  redis-1: &redis
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:redis-${TAG:-1.0}
+    build: ./app/redis
+    environment: { ANNOUNCE: redis-1 }
+  redis-2:
+    <<: *redis
+    build: !reset null
+    pull_policy: never
+    depends_on: [ redis-1 ]
+    environment: { ANNOUNCE: redis-2, REPLICAOF: redis-1 }
+  sentinel:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:sentinel-${TAG:-1.0}
+    build: ./app/sentinel
+    environment: { MASTER_HOST: redis-1, QUORUM: "1" }
+
   smtp:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:smtp-${TAG:-1.0}
     build: ./app/smtp
     environment: { RELAY_HOST: mailpit, RELAY_PORT: 1025, SMTP_TLS: none }
   mailpit:
-    image: axllent/mailpit
+    image: axllent/mailpit:v1.21
   auto:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:auto-${TAG:-1.0}
     build: ./app/auto
     environment: { FEED_TOKEN_FILE: /run/secrets/feed_token, FEED_INTERVAL: 60 }
     secrets: [ feed_token ]
   backup:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:backup-${TAG:-1.0}
     build: ./app/backup
-    environment: { BACKUP_SCHEDULE: "0 * * * *" }
-    secrets: [ db_password, moodle_db_password ]
+    environment: { BACKUP_SCHEDULE: "0 * * * *", RESTORE_TEST_SCHEDULE: "30 */6 * * *" }
+    secrets: [ backup_db_password, backup_passphrase ]
     volumes: [ backups:/backups, moodledata:/moodledata:ro ]
 
-  # only moodle builds the image; moodle-cron reuses it (building it twice fails)
+  # ---------- atenea ----------
+  # only moodle builds the image; moodle-cron reuses it
   moodle:
     <<: *moodle
     build: ./atenea/moodle
   moodle-cron:
     <<: *moodle
     pull_policy: never
-    depends_on: [moodle]
-    command: sh -c 'while true; do su -s /bin/sh www-data -c "php admin/cli/cron.php"; sleep 60; done'
+    depends_on: [ moodle ]
+    command: sh -c 'while true; do su -s /bin/sh www-data -c "php admin/cli/cron.php"; touch /tmp/cron.alive; sleep 60; done'
+    # the image checks apache, which this container does not run: check the loop instead
+    healthcheck: { test: [ CMD-SHELL, "find /tmp/cron.alive -mmin -5 | grep -q ." ], interval: 30s, timeout: 5s, start_period: 600s, retries: 3 }
   moodle-db:
-    image: mariadb:11.4
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:moodle-db-${TAG:-1.0}
+    build: ./atenea/mariadb
     environment:
       MARIADB_DATABASE: moodle
       MARIADB_USER: moodle
       MARIADB_PASSWORD_FILE: /run/secrets/moodle_db_password
       MARIADB_RANDOM_ROOT_PASSWORD: "yes"
-    secrets: [ moodle_db_password ]
+    secrets: [ moodle_db_password, exporter_db_password, backup_db_password ]
     volumes: [ moodle-db:/var/lib/mysql ]
 
+  # ---------- stats ----------
   grafana:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:grafana-${TAG:-1.0}
     build: ./stats/grafana
     restart: on-failure  # exits if postgres isn't ready yet
-    environment: &grafana-env
+    environment:
       GF_DATABASE_TYPE: postgres
       GF_DATABASE_HOST: db:5432
       GF_DATABASE_NAME: grafana
-      GF_DATABASE_USER: app
-      GF_DATABASE_PASSWORD__FILE: /run/secrets/db_password
+      GF_DATABASE_USER: grafana
+      GF_DATABASE_PASSWORD__FILE: /run/secrets/grafana_db_password
       GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
-    secrets: [ db_password, grafana_admin_password ]
+    secrets: [ grafana_db_password, grafana_admin_password ]
   prometheus:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:prometheus-${TAG:-1.0}
     build: ./stats/prometheus
+    command: [ --config.file=/etc/prometheus/prometheus.local.yml, --storage.tsdb.path=/prometheus, --storage.tsdb.retention.time=15d ]
+    volumes: [ prometheus:/prometheus ]
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    volumes: [ "/:/rootfs:ro", "/var/run:/var/run:ro", "/sys:/sys:ro", "/var/lib/docker:/var/lib/docker:ro" ]
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    command: [ --path.rootfs=/host ]
+    volumes: [ "/:/host:ro,rslave" ]
+  pg-exporter-1: &pgexp
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment: &pgexp-env
+      DATA_SOURCE_URI: pg-1:5432/postgres?sslmode=disable
+      DATA_SOURCE_USER: exporter
+      DATA_SOURCE_PASS_FILE: /run/secrets/exporter_db_password
+    secrets: [ exporter_db_password ]
+  pg-exporter-2:
+    <<: *pgexp
+    environment: { <<: *pgexp-env, DATA_SOURCE_URI: "pg-2:5432/postgres?sslmode=disable" }
+  pg-exporter-3:
+    <<: *pgexp
+    environment: { <<: *pgexp-env, DATA_SOURCE_URI: "pg-3:5432/postgres?sslmode=disable" }
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+  mysqld-exporter:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:mysqld-exporter-${TAG:-1.0}
+    build: ./stats/mysqld-exporter
+    secrets: [ exporter_db_password ]
+  blackbox:
+    image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:blackbox-${TAG:-1.0}
+    build: ./stats/blackbox
 
-volumes: { db: {}, moodle-db: {}, moodledata: {}, backups: {} }
-configs:
-  init_sql: { file: ./app/init.sql }
+volumes: { etcd-1: {}, pg-1: {}, pg-2: {}, pg-3: {}, moodle-db: {}, moodledata: {}, backups: {}, prometheus: {} }
 secrets:
-  db_password: { file: ./secrets/db_password }
+  pg_admin_password: { file: ./secrets/pg_admin_password }
+  app_db_password: { file: ./secrets/app_db_password }
+  grafana_db_password: { file: ./secrets/grafana_db_password }
+  replicator_password: { file: ./secrets/replicator_password }
+  backup_db_password: { file: ./secrets/backup_db_password }
+  exporter_db_password: { file: ./secrets/exporter_db_password }
   moodle_db_password: { file: ./secrets/moodle_db_password }
   moodle_admin_password: { file: ./secrets/moodle_admin_password }
   grafana_admin_password: { file: ./secrets/grafana_admin_password }
   feed_token: { file: ./secrets/feed_token }
+  backup_passphrase: { file: ./secrets/backup_passphrase }
