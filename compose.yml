@@ -153,7 +153,8 @@ services:
   node-exporter:
     image: prom/node-exporter:v1.8.2
     command: [ --path.rootfs=/host ]
-    volumes: [ "/:/host:ro,rslave" ]
+    # no rslave: Docker Desktop (macOS) rejects it, "/ is not a shared or slave mount"
+    volumes: [ "/:/host:ro" ]
   pg-exporter-1: &pgexp
     image: prometheuscommunity/postgres-exporter:v0.15.0
     environment: &pgexp-env
