@@ -1,5 +1,3 @@
-# NFSv4 server in user space (NFS-Ganesha): a swarm service can not be privileged,
-# but this one only needs two capabilities (cap_add in production.yml) and no kernel module.
 FROM debian:12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends nfs-ganesha nfs-ganesha-vfs netcat-openbsd \
     && rm -rf /var/lib/apt/lists/* && mkdir -p /var/run/ganesha /exports

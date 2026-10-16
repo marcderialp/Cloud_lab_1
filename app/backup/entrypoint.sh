@@ -1,5 +1,4 @@
 #!/bin/sh
-# cron jobs do not see the container environment, so we save it first
 set -e
 export -p > /env
 mkdir -p /backups/.state

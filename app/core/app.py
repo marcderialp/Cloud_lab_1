@@ -1,6 +1,3 @@
-"""Core app: a page where people leave reviews with a 1-5 rating.
-Postgres for the data (Patroni cluster behind haproxy), redis behind sentinel for the cache, mails through the smtp service,
-/api/ratings for the auto feeder and /metrics for prometheus."""
 import json
 import os
 import smtplib
@@ -18,13 +15,10 @@ NODE = os.environ.get("NODE") or socket.gethostname()
 
 
 def secret(name):
-    # docker secrets: the value is in the file given by NAME_FILE
     path = os.environ.get(name + "_FILE")
     return open(path).read().strip() if path else os.environ.get(name, "")
 
 
-# "db" is haproxy: :5432 is always the Patroni leader (after a failover too),
-# :5433 are the replicas. Reads try the replicas first and fall back to the leader.
 _H = os.environ.get("DB_HOST", "db")
 _BASE = (f"dbname=app user={os.environ.get('DB_USER', 'app')} "
          f"password={secret('DB_PASSWORD')} connect_timeout=3")
@@ -50,7 +44,6 @@ def db(read_only=False):
 
 
 def cache_version():
-    # every write bumps the version, so old entries are never read again
     try:
         return int(cache.get("ver") or 0)
     except redis.RedisError:
@@ -85,7 +78,6 @@ def headers(resp):
 
 
 def summary(read_only=False):
-    """(average, total, {rating: count}) cached in redis."""
     key = f"summary:{cache_version()}"
     if (hit := cache_get(key)) is not None:
         CACHE.labels("hit").inc()
@@ -105,7 +97,7 @@ def reviews(page):
     key = f"reviews:{cache_version()}:{page}"
     if (hit := cache_get(key)) is not None:
         return hit
-    with db() as conn:  # primary: the user must see what has just written
+    with db() as conn:
         rows = conn.execute(
             "SELECT author, body, rating, to_char(created, 'YYYY-MM-DD HH24:MI') "
             "FROM comments ORDER BY id DESC LIMIT %s OFFSET %s",
@@ -116,7 +108,6 @@ def reviews(page):
 
 @app.errorhandler(psycopg.OperationalError)
 def database_unavailable(e):
-    # at a cold start or during a failover: a clean 503, not a traceback
     app.logger.warning("database unavailable: %s", str(e).strip().splitlines()[0] if str(e).strip() else e)
     return "database not ready", 503
 
@@ -169,7 +160,6 @@ def comment():
     except Exception as e:
         app.logger.warning("mail not sent: %s", e)
     resp = redirect("/")
-    # the front cache skips its copy of "/" for this user while the cookie lives
     resp.set_cookie("posted", "1", max_age=10)
     return resp
 
@@ -190,7 +180,6 @@ def api_stats():
     with db(read_only=True) as conn:
         ext = conn.execute("SELECT DISTINCT ON (url) url, rating, captured::text "
                            "FROM external_ratings ORDER BY url, captured DESC").fetchall()
-        # the last 100 captures, oldest first (ISO times: Grafana plots them as a series)
         hist = conn.execute(
             "SELECT url, rating, to_char(captured AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') "
             "FROM (SELECT * FROM external_ratings ORDER BY captured DESC LIMIT 100) t "

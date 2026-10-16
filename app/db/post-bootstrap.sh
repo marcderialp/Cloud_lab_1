@@ -1,8 +1,4 @@
 #!/bin/sh
-# Runs once, on the first node of the cluster (Patroni gives it the connection URL).
-# One role per job, nobody uses the superuser:
-#   app (owner of db app)      grafana (owner of db grafana)
-#   backup (read only dumps)   exporter (pg_monitor)   [replicator is created by Patroni]
 set -e
 pw() { cat "/run/secrets/$1"; }
 psql -v ON_ERROR_STOP=1 "$1" \
@@ -21,7 +17,6 @@ REVOKE CONNECT ON DATABASE grafana FROM PUBLIC;
 GRANT CONNECT ON DATABASE app TO backup;
 GRANT CONNECT ON DATABASE grafana TO backup;
 SQL
-# the application tables: created here, so the replicas of core never race to do it
 psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U app -d app <<'SQL'
 CREATE TABLE comments (
     id SERIAL PRIMARY KEY, author TEXT NOT NULL, body TEXT NOT NULL,

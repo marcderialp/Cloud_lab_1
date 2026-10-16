@@ -1,5 +1,4 @@
 FROM php:8.3-apache
-# Moodle 4.5 LTS, pinned: version + sha256 (bump both together)
 ARG MOODLE_VERSION=4.5.14
 ARG MOODLE_SHA256=b8da2dd90a29b88980d2c5ef6bf90bdfca200c366fdbc4e50f3d29d0dcbcb6cf
 
@@ -9,8 +8,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && docker-php-ext-install gd intl zip mysqli soap opcache exif \
     && rm -rf /var/lib/apt/lists/*
 
-# its own layer: a network failure here does not repeat the compilation above.
-# The file is downloaded first (with retries) and verified before extracting.
 RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o /tmp/moodle.tgz \
         "https://download.moodle.org/download.php/direct/stable405/moodle-${MOODLE_VERSION}.tgz" \
     && echo "${MOODLE_SHA256}  /tmp/moodle.tgz" | sha256sum -c - \
@@ -25,7 +22,6 @@ RUN printf 'max_input_vars=5000\nopcache.memory_consumption=128\nopcache.max_acc
 COPY config.php /var/www/moodle/config.php
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-# the first start may spend minutes installing the database
 HEALTHCHECK --interval=20s --timeout=5s --start-period=600s --retries=3 \
     CMD curl -fsS -o /dev/null http://127.0.0.1/login/index.php || exit 1
 ENTRYPOINT ["/entrypoint.sh"]

@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -12,6 +13,7 @@
   </script>
   {% endif %}
 </head>
+
 <body>
   <header class="hero">
     <div class="wrap">
@@ -24,13 +26,15 @@
     <section class="card summary">
       <div class="big">{{ avg or '–' }}</div>
       <div class="stars" aria-label="average rating">
-        {% for i in range(1, 6) %}<span class="{{ 'on' if avg and i <= avg|round(0, 'ceil') else '' }}">★</span>{% endfor %}
+        {% for i in range(1, 6) %}<span class="{{ 'on' if avg and i <= avg|round(0, 'ceil') else '' }}">★</span>{%
+        endfor %}
       </div>
       <p class="muted">{{ total }} review{{ '' if total == 1 else 's' }}</p>
       <ul class="bars">
         {% for r in range(5, 0, -1) %}
         {% set n = dist.get(r|string, 0) %}
-        <li><span>{{ r }}★</span><i><b style="width: {{ (100 * n / total) if total else 0 }}%"></b></i><em>{{ n }}</em></li>
+        <li><span>{{ r }}★</span><i><b style="width: {{ (100 * n / total) if total else 0 }}%"></b></i><em>{{ n }}</em>
+        </li>
         {% endfor %}
       </ul>
     </section>
@@ -41,7 +45,7 @@
         <input name="author" placeholder="Your name" maxlength="60" required>
         <div class="rate" role="radiogroup" aria-label="rating">
           {% for r in range(5, 0, -1) %}
-          <input type="radio" id="r{{ r }}" name="rating" value="{{ r }}" {{ 'checked' if r == 5 else '' }}>
+          <input type="radio" id="r{{ r }}" name="rating" value="{{ r }}" {{ 'checked' if r==5 else '' }}>
           <label for="r{{ r }}" title="{{ r }}">★</label>
           {% endfor %}
         </div>
@@ -56,8 +60,10 @@
       <article class="review">
         <div class="avatar">{{ author[:1]|upper }}</div>
         <div>
-          <header><b>{{ author }}</b> <span class="stars sm">{% for i in range(1, 6) %}<span class="{{ 'on' if i <= rating else '' }}">★</span>{% endfor %}</span>
-            <time class="muted">{{ created }}</time></header>
+          <header><b>{{ author }}</b> <span class="stars sm">{% for i in range(1, 6) %}<span
+                class="{{ 'on' if i <= rating else '' }}">★</span>{% endfor %}</span>
+            <time class="muted">{{ created }}</time>
+          </header>
           <p>{{ body }}</p>
         </div>
       </article>
@@ -74,15 +80,15 @@
     </section>
   </main>
 
-  <!-- the HTML is cached by the front, so the front node is asked at load time -->
   <footer class="nodes">
     <span>front: <b id="front-node">…</b></span>
     <span>app: <b>{{ node }}</b></span>
   </footer>
   <script>
-    fetch('/__node', {cache: 'no-store'}).then(r => r.text())
+    fetch('/__node', { cache: 'no-store' }).then(r => r.text())
       .then(t => document.getElementById('front-node').textContent = t.trim())
       .catch(() => document.getElementById('front-node').textContent = '?');
   </script>
 </body>
+
 </html>

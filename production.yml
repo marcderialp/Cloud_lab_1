@@ -1,20 +1,3 @@
-# Production on docker swarm: the 7-node architecture (front x2, app x2, stats, atenea, backup).
-# In this project it runs on our own computer (scripts/sim-swarm.sh builds the 7 nodes with
-# docker-in-docker) and serves HTTPS with a self-signed certificate on https://app.localhost,
-# https://lms.localhost and https://grafana.localhost. It is not opened to the Internet.
-#
-#   scripts/label-nodes.sh                   # once, after the nodes joined the swarm (prints NFS_SERVER)
-#   export NFS_SERVER=<private IP of the atenea node>
-#   docker stack deploy -c production.yml lab1
-#
-# Images come from Docker Hub (omarcornejo/lab1grouph:<service>-<TAG>), published with
-# scripts/publish.sh. Everything has a default except NFS_SERVER. A real domain
-# (DOMAIN, LE_EMAIL) would make certbot issue a Let's Encrypt certificate; with a local
-# name such as the default "localhost" the letsencrypt service stays idle.
-
-# stateless services: 2 replicas, exactly one per node (max_replicas_per_node), so a node
-# failure never takes both. With one replica per node there is no free slot for start-first,
-# so the update goes one replica at a time (stop-first): the other one keeps serving.
 x-stateless: &stateless
   replicas: 2
   placement: { max_replicas_per_node: 1 }
@@ -29,7 +12,6 @@ x-single: &single
   replicas: 1
   restart_policy: { condition: any, delay: 10s }
 
-# NFS_SERVER (private IP of the atenea node, printed by scripts/label-nodes.sh) is required
 x-nfs: &nfs "addr=${NFS_SERVER:?NFS_SERVER is required},nfsvers=4.2,rw,hard"
 x-moodle: &moodle
   image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:moodle-${TAG:-1.0}
@@ -39,7 +21,6 @@ x-moodle: &moodle
   networks: [ proxy, atenea ]
 
 services:
-  # ================= basic (front nodes) =================
   frontend:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:frontend-${TAG:-1.0}
     build: ./basic/frontend
@@ -49,15 +30,13 @@ services:
       CERT_PASSWORD: ${CERT_PASSWORD:-groupH}
       NODE: "{{.Node.Hostname}}"
       NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates-prod
-    ports: [ "80:80", "443:443", "8080:8080" ]   # 8080: web page of the mail catcher
+    ports: [ "80:80", "443:443", "8080:8080" ]
     volumes: [ "certs:/etc/letsencrypt:ro", "acme:/var/www/acme:ro" ]
     networks: [ proxy ]
     deploy:
       <<: *stateless
       placement: { max_replicas_per_node: 1, constraints: [ "node.labels.role == front" ] }
 
-  # gets the certificate by itself (HTTP-01 through the frontend) and renews it; the
-  # frontend starts with a self signed one and switches when this one exists
   letsencrypt:
     image: certbot/certbot:v2.11.0
     entrypoint:
@@ -83,7 +62,6 @@ services:
       <<: *single
       placement: { constraints: [ "node.labels.role == front" ] }
 
-  # NFS server inside the stack (user space, two capabilities, no privileged mode)
   nfs:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:nfs-${TAG:-1.0}
     build: ./basic/nfs
@@ -96,7 +74,6 @@ services:
       <<: *stateful
       placement: { constraints: [ "node.labels.role == atenea" ] }
 
-  # ================= app (app nodes) =================
   core:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:core-${TAG:-1.0}
     build: ./app/core
@@ -121,9 +98,6 @@ services:
       <<: *stateless
       placement: { max_replicas_per_node: 1, constraints: [ "node.labels.role == app" ] }
 
-  # postgres: three Patroni nodes (app1, app2, stats) with leader election in a three
-  # member etcd; haproxy ("db") always points to the leader, so after a failure the
-  # replicas elect a new leader by themselves and nothing else has to change
   etcd-1: &etcd
     image: quay.io/coreos/etcd:v3.5.15
     command: [ etcd, --name=etcd-1, --data-dir=/etcd-data, --listen-client-urls=http://0.0.0.0:2379,
@@ -132,8 +106,6 @@ services:
                "--initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380",
                --initial-cluster-token=lab1 ]
     volumes: [ "etcd-1:/etcd-data" ]
-    # no healthcheck on purpose: swarm DNS only resolves a service whose tasks are healthy, and
-    # the three members must resolve each other to form the quorum that makes them healthy
     healthcheck: { disable: true }
     networks: [ app ]
     deploy:
@@ -199,7 +171,6 @@ services:
       <<: *stateless
       placement: { max_replicas_per_node: 1, constraints: [ "node.labels.role == app" ] }
 
-  # redis: master on slot 1, replica on slot 2, three sentinels (slot 1, slot 2, stats)
   redis-1:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:redis-${TAG:-1.0}
     build: ./app/redis
@@ -239,9 +210,6 @@ services:
   smtp:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:smtp-${TAG:-1.0}
     build: ./app/smtp
-    # by default the relay is mailpit (a mail catcher with a web page), so the mails of the
-    # application can be read without any external provider; to send real mail set
-    # RELAY_HOST/RELAY_PORT/RELAY_USER/RELAY_PASSWORD and SMTP_TLS=encrypt
     environment:
       RELAY_HOST: ${RELAY_HOST:-mailpit}
       RELAY_PORT: ${RELAY_PORT:-1025}
@@ -268,8 +236,6 @@ services:
       <<: *single
       placement: { constraints: [ "node.labels.role == app" ] }
 
-  # ================= atenea (atenea node) =================
-  # only moodle builds the image; moodle-cron reuses it
   moodle:
     <<: *moodle
     build: ./atenea/moodle
@@ -279,7 +245,6 @@ services:
   moodle-cron:
     <<: *moodle
     command: sh -c 'while true; do su -s /bin/sh www-data -c "php admin/cli/cron.php"; touch /tmp/cron.alive; sleep 60; done'
-    # the image checks apache, which this container does not run: check the loop instead
     healthcheck: { test: [ CMD-SHELL, "find /tmp/cron.alive -mmin -5 | grep -q ." ], interval: 30s, timeout: 5s, start_period: 600s, retries: 3 }
     networks: [ atenea ]
     deploy:
@@ -300,8 +265,6 @@ services:
       <<: *stateful
       placement: { constraints: [ "node.labels.role == atenea" ] }
 
-  # ================= backup (backup node) =================
-  # encrypted dumps on the local disk of a node that is neither an app node nor the NFS node
   backup:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:backup-${TAG:-1.0}
     build: ./app/backup
@@ -316,7 +279,6 @@ services:
       <<: *single
       placement: { constraints: [ "node.labels.role == backup" ] }
 
-  # ================= stats (stats node) =================
   grafana:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:grafana-${TAG:-1.0}
     build: ./stats/grafana
@@ -333,14 +295,11 @@ services:
     deploy:
       <<: *stateless
       placement: { constraints: [ "node.labels.role == stats" ] }
-      # two processes on the same node: HA of the process, not of the node
-  # two replicas on two nodes (stats and backup), each with its own time series database;
-  # both scrape the same targets, so the one that answers is equivalent
   prometheus:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:prometheus-${TAG:-1.0}
     build: ./stats/prometheus
     command: [ --config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.path=/prometheus, --storage.tsdb.retention.time=15d ]
-    volumes: [ "/prometheus" ]   # anonymous volume: each replica keeps its own TSDB
+    volumes: [ "/prometheus" ]
     networks: [ stats, proxy, app ]
     deploy:
       <<: *stateless
@@ -404,11 +363,9 @@ networks:
   stats: { driver: overlay, driver_opts: { encrypted: "true" } }
 
 volumes:
-  # shared, on NFS (the nfs service of the atenea node)
   certs: { driver_opts: { type: nfs, o: *nfs, device: ":/letsencrypt" } }
   acme: { driver_opts: { type: nfs, o: *nfs, device: ":/acme" } }
   moodledata: { driver_opts: { type: nfs, o: *nfs, device: ":/moodledata" } }
-  # local disk of the node that runs each service
   nfs-data: {}
   etcd-1: {}
   etcd-2: {}

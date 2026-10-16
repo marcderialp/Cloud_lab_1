@@ -1,5 +1,4 @@
 #!/bin/sh
-# postfix that accepts mail from the docker networks and relays it to the provider
 set -e
 postconf -e "mydestination=" "maillog_file=/dev/stdout" "inet_protocols=ipv4" \
     "mynetworks=127.0.0.0/8 10.0.0.0/8 172.16.0.0/12" "alias_maps=" "alias_database=" \

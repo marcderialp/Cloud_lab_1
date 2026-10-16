@@ -1,6 +1,4 @@
 #!/bin/sh
-# Encrypted dumps of both databases and of moodledata into /backups (a disk that
-# only this node has: not the app nodes, not the NFS node). Keeps RETENTION_DAYS.
 set -e
 . /env
 . /lib.sh
@@ -13,7 +11,6 @@ fail() {
 }
 trap 'fail' EXIT
 
-# dump from a replica (no load on the leader), fall back to the leader
 PGH=db; PGP=5433
 pg_isready -h $PGH -p $PGP -q || PGP=5432
 export PGPASSWORD=$(cat /run/secrets/backup_db_password)

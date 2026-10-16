@@ -1,5 +1,4 @@
 #!/bin/sh
-# Sentinel watching MASTER_HOST. Quorum QUORUM (2 of 3 in production).
 cat > /data/sentinel.conf <<CONF
 port 26379
 dir /data
