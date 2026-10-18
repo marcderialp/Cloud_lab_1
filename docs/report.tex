@@ -4,6 +4,8 @@
 \usepackage[margin=2.2cm]{geometry}
 \usepackage{booktabs,tabularx,enumitem,listings,xcolor,array}
 \usepackage{longtable}
+\usepackage{graphicx,placeins}
+\graphicspath{{screenshots/}{docs/screenshots/}}
 \usepackage{tikz}
 \usetikzlibrary{positioning,fit,backgrounds,arrows.meta,calc}
 \usepackage[hidelinks]{hyperref}
@@ -211,27 +213,127 @@ Postgres leader & Brief write pause & Patroni elects replica; HAProxy reroutes t
 Updates are applied one container at a time (\texttt{parallelism: 1}, \texttt{order: stop-first}) with automated rollback upon error (\texttt{failure\_action: rollback}). Each custom image includes a defined \texttt{HEALTHCHECK}, guaranteeing that an updated replica is verified healthy before the deployment progresses to the next node. Furthermore, stateless services enforce \texttt{max\_replicas\_per\_node: 1}, ensuring replicas reside on distinct physical hosts so that a single host failure never compromises service availability.
 
 
+\FloatBarrier
+\clearpage
 \section{Deployment}
 
-Local environment (one machine, no TLS):
-\begin{lstlisting}
-docker compose pull && docker compose up -d
-\end{lstlisting}
+We designed two deployment environments: a local environment for development
+and testing, and a production environment based on Docker Swarm. Both use the
+same images published in \texttt{omarcornejo/lab1grouph} on Docker Hub,
+so we can deploy the application without rebuilding the images.
+The main differences are how we organize the services, manage storage
+and expose the applications to users.
 
-Production (seven nodes; \texttt{scripts/sim-swarm.sh up} does all this on one computer):
-\begin{lstlisting}
-# once: build and publish the images
-docker login && scripts/publish.sh
+\subsection{Local environment (test)}
 
-# on a manager, after the 7 nodes joined the swarm
-scripts/label-nodes.sh                      # labels the nodes, prints the NFS_SERVER line
-export NFS_SERVER=<private IP of atenea>
-docker stack deploy -c production.yml lab1
-\end{lstlisting}
+For the local environment, we used Docker Compose to run the entire
+infrastructure on a single machine. We chose this approach because it
+makes it easier to develop and test the different components without
+having to manage multiple nodes. Even though everything runs on one
+host, we kept the same main services as in production, including the
+PostgreSQL and Redis clusters, Moodle and the monitoring platform.
 
-All the images are in one public Docker Hub repository, \texttt{omarcornejo/lab1grouph},
-with one tag per service (\texttt{<service>-<version>}), so no registry has to be started
-before deploying.
+We defined the infrastructure in \texttt{compose.yml}, where we specified
+the services, networks and volumes. We used named volumes to keep
+persistent data even when containers are stopped or recreated.
+For simplicity, we configured the frontend to use HTTP on port~8080,
+since we do not need HTTPS certificates for local testing.
+
+Figure~\ref{fig:deploy-local} shows the local deployment. All 29
+containers are running, and those with configured healthchecks
+report a healthy status. We also confirmed that the reviews application
+is accessible through \texttt{http://app.localhost:8080}.
+
+\begin{figure}[!htbp]
+\centering
+\begin{minipage}[c]{0.34\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{compose_ps.png}
+    \par\smallskip
+    {\footnotesize (a) Container status.}
+\end{minipage}
+\hfill
+\begin{minipage}[c]{0.63\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{app.png}
+    \par\smallskip
+    {\footnotesize (b) Reviews application.}
+\end{minipage}
+\caption{Local deployment: Docker Compose container status and application
+accessible at \texttt{http://app.localhost:8080}.}
+\label{fig:deploy-local}
+\end{figure}
+
+\FloatBarrier
+\subsection{Production environment (simulated Swarm)}
+
+For production, we decided to use Docker Swarm to distribute the
+infrastructure across seven nodes. Three of them act as managers,
+while the other four are workers. Since we did not have seven
+physical machines available, we used Docker-in-Docker to simulate
+the nodes on a single computer. This allowed us to work with a
+distributed architecture without needing additional hardware.
+
+We defined the production configuration in \texttt{production.yml}
+and deployed it as a Swarm stack. Unlike the local environment,
+we used node labels and placement constraints to control where
+each service runs. This way, we could separate the frontend,
+application, monitoring, storage and backup services across
+different nodes.
+
+We also configured multiple replicas for the services that need
+high availability, placing them on different nodes whenever
+possible. For the databases and cache, we kept the clustering
+mechanisms described in the previous sections.
+
+To allow communication between services running on different
+nodes, we used Docker overlay networks. We configured two Nginx
+frontend replicas to handle incoming requests and forward them
+to the corresponding services. We also enabled HTTPS on
+port~443. Since we used \texttt{localhost} instead of a public
+domain, we used a self-signed certificate.
+
+Figure~\ref{fig:deploy-production} shows the production deployment.
+All seven nodes are in \texttt{Ready} and \texttt{Active} states,
+and the services have reached their expected replica counts.
+We also accessed the reviews application through
+\texttt{https://app.localhost}, where the footer shows which
+frontend and application nodes handled the request.
+
+\begin{figure}[!htbp]
+\centering
+
+\includegraphics[width=0.98\linewidth]{production-nodes.png}
+\par\smallskip
+{\footnotesize (a) Swarm node availability.}
+
+\par\medskip
+
+\begin{minipage}[c]{0.44\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{production-services.png}
+    \par\smallskip
+    {\footnotesize (b) Service replica status.}
+\end{minipage}
+\hfill
+\begin{minipage}[c]{0.54\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{app-production.png}
+    \par\smallskip
+    {\footnotesize (c) Production application.}
+\end{minipage}
+
+\caption{Simulated production deployment: Swarm nodes, service replicas
+and application accessible at \texttt{https://app.localhost}.}
+\label{fig:deploy-production}
+\end{figure}
+
+In this section, we focused on showing how we deployed both
+environments and how we organized the infrastructure.
+We cover the functional tests, scalability and failure recovery
+in Section~\ref{sec:test-cases}.
+
+\FloatBarrier
 
 \section{Access, users and passwords}
 
@@ -394,6 +496,7 @@ without login, which is acceptable in the laboratory because it only holds notif
 \item Backups are encrypted and verified.
 \end{itemize}
 \section{Test cases}
+\label{sec:test-cases}
 
 Each case says what to do, where to look and what must be seen. Commands are run from the
 project folder (local environment) or on the manager node, \texttt{front1} (production,
