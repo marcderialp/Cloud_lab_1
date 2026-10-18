@@ -78,6 +78,7 @@ services:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:sentinel-${TAG:-1.0}
     build: ./app/sentinel
     environment: { MASTER_HOST: redis-1, QUORUM: "1" }
+    dns_opt: [ "timeout:1", "attempts:1" ]
 
   smtp:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:smtp-${TAG:-1.0}
