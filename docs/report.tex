@@ -1,6 +1,8 @@
 \documentclass[11pt,a4paper]{article}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
+\usepackage{float}
+
 \usepackage[margin=2.2cm]{geometry}
 \usepackage{booktabs,tabularx,enumitem,listings,xcolor,array}
 \usepackage{longtable}
@@ -297,164 +299,156 @@ before deploying.
 
 \section{Access, users and passwords}
 
-All the passwords are Docker secrets, files of the \texttt{secrets/} folder, and all of them
-have the value \texttt{groupH}, a deliberate simplification of the laboratory (they would be
-changed before a real deployment). The only exception is the Moodle administrator, because
-Moodle refuses passwords that do not follow its policy (upper and lower case, digit and
-symbol).
+For security and centralized configuration, credentials are injected with Docker secrets mounted at \texttt{/run/secrets}. For testing purposes within this laboratory setup, default passwords are standardized to \texttt{groupH}, the only exception is Moodle administrator, because Moodle refuses passwords that do not follow its policy (upper and lower case, digit, and symbol).
 
 \subsection{Web addresses}
 
 \begin{table}[ht]
 \centering\small
-\begin{tabularx}{\textwidth}{llYl}
+\begin{tabularx}{\textwidth}{llXl}
 \toprule
-Service & Local (\texttt{compose.yml}) & Production (\texttt{production.yml}) & Login \\
+Service & Local (\texttt{compose.yml}) & Production (\texttt{production.yml}) & Auth \\
 \midrule
-Reviews application & \texttt{http://app.localhost:8080} & \texttt{https://app.localhost} & none \\
-Moodle (Atenea) & \texttt{http://lms.localhost:8080} & \texttt{https://lms.localhost} & yes \\
-Grafana & \texttt{http://grafana.localhost:8080} & \texttt{https://grafana.localhost} & yes \\
-Mailpit (captured mails) & \texttt{http://mail.localhost:8080} & \texttt{http://mail.localhost:8080} & none \\
+Reviews application & \texttt{http://app.localhost:8080} & \texttt{https://app.localhost} & Public \\
+Moodle (Atenea) & \texttt{http://lms.localhost:8080} & \texttt{https://lms.localhost} & Required \\
+Grafana & \texttt{http://grafana.localhost:8080} & \texttt{https://grafana.localhost} & Required \\
+Mailpit & \texttt{http://mail.localhost:8080} & \texttt{http://mail.localhost:8080} & Public \\
 \bottomrule
 \end{tabularx}
-\caption{Web addresses. In production the certificate is self-signed, so the browser shows
-a warning that has to be accepted; port 80 redirects to 443.}
+\caption{Deployed web endpoints and authentication requirements.}
 \end{table}
 
-Prometheus, Patroni, etcd, HAProxy and the exporters are not published: they are reached
-from inside the stack (for example, \texttt{docker exec} on the container).
-
+\begin{figure}[htbp]
+\begin{figure}
+    \centering
+    \includegraphics[width=0.5\linewidth]{screenshot4webs.png}
+    \caption{Enter Caption}
+    \label{fig:placeholder}
+\end{figure}
+\centering
+\includegraphics[width=0.85\textwidth]{screenshot4webs.png}
+\caption{Running deployment of the web addresses.}
+\label{fig:app_preview}
+\end{figure}
 \subsection{Users and passwords}
 
-\begin{table}[ht]
+Table~\ref{tab:credentials} shows the service credentials secret files, and the configured database access scopes.
+
+\begin{table}[H]
 \centering\small
 \begin{tabularx}{\textwidth}{lllY}
 \toprule
-Service & User & Password & Secret file / note \\
+\textbf{Service} & \textbf{User} & \textbf{Password} & \textbf{Secret File} \\
 \midrule
 Grafana & \texttt{admin} & \texttt{groupH} & \texttt{grafana\_admin\_password} \\
 Moodle & \texttt{admin} & \texttt{groupH-2026} & \texttt{moodle\_admin\_password} \\
-PostgreSQL, administrator & \texttt{postgres} & \texttt{groupH} & \texttt{pg\_admin\_password}; used only by Patroni \\
-PostgreSQL, application & \texttt{app} & \texttt{groupH} & \texttt{app\_db\_password}; owner of database \texttt{app} \\
-PostgreSQL, Grafana & \texttt{grafana} & \texttt{groupH} & \texttt{grafana\_db\_password}; owner of database \texttt{grafana} \\
-PostgreSQL, replication & \texttt{replicator} & \texttt{groupH} & \texttt{replicator\_password} \\
-PostgreSQL, backups & \texttt{backup} & \texttt{groupH} & \texttt{backup\_db\_password}; read only \\
-PostgreSQL, monitoring & \texttt{exporter} & \texttt{groupH} & \texttt{exporter\_db\_password}; \texttt{pg\_monitor} \\
+PostgreSQL (Patroni) & \texttt{postgres} & \texttt{groupH} & \texttt{pg\_admin\_password} (Internal HA management) \\
+PostgreSQL (App) & \texttt{app} & \texttt{groupH} & \texttt{app\_db\_password} (Owner of \texttt{app} DB) \\
+PostgreSQL (Grafana) & \texttt{grafana} & \texttt{groupH} & \texttt{grafana\_db\_password} (Owner of \texttt{grafana} DB) \\
+PostgreSQL (Replication) & \texttt{replicator} & \texttt{groupH} & \texttt{replicator\_password} \\
+PostgreSQL (Backup) & \texttt{backup} & \texttt{groupH} & \texttt{backup\_db\_password} (\texttt{pg\_read\_all\_data}) \\
+PostgreSQL (Metrics) & \texttt{exporter} & \texttt{groupH} & \texttt{exporter\_db\_password} (\texttt{pg\_monitor}) \\
 MariaDB (Moodle) & \texttt{moodle} & \texttt{groupH} & \texttt{moodle\_db\_password} \\
-MariaDB, backups / monitoring & \texttt{backup}, \texttt{exporter} & \texttt{groupH} & same secrets as in PostgreSQL; read only \\
-Backup encryption & --- & \texttt{groupH} & \texttt{backup\_passphrase} (AES-256) \\
-Self-signed TLS key & --- & \texttt{groupH} & variable \texttt{CERT\_PASSWORD} \\
-Feeder token (\texttt{/api/ratings}) & --- & \texttt{groupH} & \texttt{feed\_token}, bearer token \\
-Docker Hub (pull) & --- & --- & public repository, no credentials \\
+MariaDB (Auxiliary) & \texttt{backup}, \texttt{exporter} & \texttt{groupH} & Shared secrets (Read-only access) \\
+Backup Encryption & --- & \texttt{groupH} & \texttt{backup\_passphrase} (AES-256-CBC) \\
+Self-signed TLS key & --- & \texttt{groupH} & \texttt{CERT\_PASSWORD} \\
+Feeder API & --- & \texttt{groupH} & \texttt{feed\_token} (Bearer Token) \\
 \bottomrule
 \end{tabularx}
-\caption{Users and passwords of the project.}
+\caption{System account roles and Docker secret mappings.}
+\label{tab:credentials}
 \end{table}
-
-The reviews application needs no login: anybody can read and write reviews. In both
-environments the notification mails go to Mailpit, a mail catcher with a web page, so they
-can be read without any external provider. To send real mail, \texttt{RELAY\_HOST},
-\texttt{RELAY\_PORT}, \texttt{RELAY\_USER}, \texttt{RELAY\_PASSWORD} and \texttt{SMTP\_TLS}
-point the relay to a provider.
 
 \section{Data management and backups}
 \label{sec:backup}
+
+To avoid database corruption caused by network disruptions or file-locking conflicts, transactional DBMS files are stored directly on local node drives rather than over NFS.
 
 \begin{table}[ht]
 \centering\small
 \begin{tabular}{lll}
 \toprule
-Data & Volume & Location \\
+\textbf{Data Target} & \textbf{Volume Name} & \textbf{Physical Node Location} \\
 \midrule
-PostgreSQL (3 nodes), etcd & \texttt{pg-1..3}, \texttt{etcd-1..3} & local disk of app1, app2, stats \\
-MariaDB, NFS data & \texttt{moodle-db}, \texttt{nfs-data} & local disk of atenea \\
-moodledata, certificates & \texttt{moodledata}, \texttt{certs}, \texttt{acme} & NFS (atenea) \\
-backups & \texttt{backups} & local disk of the \textbf{backup} node \\
-Prometheus (2 replicas) & anonymous volume of each task & local disk of stats and backup \\
-Redis & none & memory (cache, replicated) \\
+PostgreSQL Cluster \& etcd & \texttt{pg-1..3}, \texttt{etcd-1..3} & Local disk (\texttt{app1}, \texttt{app2}, \texttt{stats}) \\
+MariaDB \& NFS Root & \texttt{moodle-db}, \texttt{nfs-data} & Local disk (\texttt{atenea}) \\
+Moodle Data \& Certificates & \texttt{moodledata}, \texttt{certs}, \texttt{acme} & NFS Storage (\texttt{atenea}) \\
+Encrypted Backups & \texttt{backups} & Dedicated disk (\texttt{backup}) \\
+Prometheus Replicas & Anonymous volumes & Local disk (\texttt{stats}, \texttt{backup}) \\
+Redis Cache & In-Memory & Replicated RAM \\
 \bottomrule
 \end{tabular}
-\caption{Where the data is stored.}
+\caption{Physical storage distribution across Swarm nodes.}
+\label{tab:storage_layout}
 \end{table}
 
-Databases are not on NFS (locking and network cuts risk corruption). The backup service
-lives on a node that is neither an app node nor the NFS node, with its own disk, so no live
-data shares a node with its backup. Every night (03:30) it creates a folder with
-\begin{itemize}
-\item \texttt{app.dump.enc}, \texttt{grafana.dump.enc}: \texttt{pg\_dump -Fc} from the
-\emph{replicas} (\texttt{db:5433}, no load on the leader; falls back to the leader), as the read-only role
-\texttt{backup};
-\item \texttt{moodle.sql.gz.enc}: \texttt{mariadb-dump --single-transaction} with a read-only
-MariaDB account;
-\item \texttt{moodledata.tar.gz.enc}: moodledata without caches and sessions;
-\item \texttt{SHA256SUMS}.
-\end{itemize}
-Every file is encrypted with AES-256-CBC, PBKDF2 (\texttt{openssl enc}) and the passphrase
-of a Docker secret. The folder is written as \texttt{.partial} and renamed at the end, so an
-interrupted backup is never mistaken for a good one. Folders older than 14 days are removed.
 
-\paragraph{Automatic restore test.} Every Sunday (and on demand with
-\texttt{docker exec <backup> /restore-test.sh}) the latest backup is verified: checksums,
-decryption, restoration of the application dump into a throw-away PostgreSQL started inside
-the container and of the Moodle dump into a throw-away MariaDB, and a count of rows and
-tables. The result is published as metrics (\texttt{backup\_restore\_test\_ok}, rows,
-tables) that Prometheus scrapes, with alerts if the last backup is older than 25~h or the
-test fails. The result is the number of reviews and of Moodle tables recovered.
+The backup service operates on a dedicated host isolated from core application nodes. Scheduled daily at 03:30, the pipeline performs:
+\begin{enumerate}
+    \item \textbf{PostgreSQL Dump}: Uses \texttt{pg\_dump -Fc} routed to read-only replicas (\texttt{db:5433}) under the \texttt{backup} role to prevent load on the HA leader.
+    \item \textbf{MariaDB Dump}: Executes \texttt{mariadb-dump --single-transaction} for transactional consistency.
+    \item \textbf{Moodle Data Storage}: Archives \texttt{moodledata} while stripping volatile session and cache directories.
+    \item \textbf{Encryption \& Integrity}: Encrypts files using OpenSSL AES-256-CBC (PBKDF2) with the secret passphrase and generates matching \texttt{SHA256SUMS}.
+\end{enumerate}
 
-Restoring: \texttt{scripts/restore.sh <folder> app|grafana|moodle|moodledata}.
+Backups are initially written with a \texttt{.partial} suffix and atomic-renamed upon completion, and retention is configured for 14 days.
+
+
+An automated integrity check runs every Sunday (and on demand with
+\texttt{docker exec <backup> /restore-test.sh}) 
+The routine verifies checksums, decrypts archives, restores dumps into temporary containerized DBMS instances, and validates recovered row and table counts. Test outcomes
+are exported to Prometheus (\texttt{backup\_restore\_test\_ok}).
 
 \section{Observability}
 \label{sec:obs}
 
-Prometheus uses DNS service discovery (\texttt{tasks.<service>}) so scaled replicas are
-scraped without changes. Table~\ref{tab:obs} lists the sources.
+
+Prometheus uses DNS service discovery (\texttt{tasks.}) so scaled replicas are scraped without manual changes. Dashboards are provisioned declaratively via Git, where Grafana visualizes node metrics alongside custom ratings using the Infinity plugin. Additionally, Prometheus alerting rules (\texttt{rules.yml}) flag offline endpoints, replication delays, missing cluster leaders, and backup failures. Table~\ref{tab:obs} summarizes the metric sources and monitored targets.
+
 
 \begin{table}[ht]
 \centering\small
-\renewcommand{\arraystretch}{1.25}
-\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.6cm}>{\raggedright\arraybackslash}p{3.6cm}Y@{}}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.5cm}>{\raggedright\arraybackslash}p{3.5cm}Y@{}}
 \toprule
-Source & Watches & What we look at \\
+\textbf{Metric Source} & \textbf{Monitored Target} & \textbf{Key Operational Indicators} \\
 \midrule
-\texttt{core} & the application & requests per replica; reviews posted; cache hits and misses \\
-nginx exporter (inside the frontend image) & each frontend replica & requests per second; active connections \\
-postgres\_exporter (one per node) and Patroni & the three PostgreSQL nodes & connections; transactions; replication lag; which node is the leader \\
-redis\_exporter & Redis master and replica & role; connected replicas; hit ratio; memory \\
-mysqld\_exporter & MariaDB of Moodle & connected threads; queries per second \\
-blackbox\_exporter & frontend, core, static, Moodle and Grafana & availability and response time as a user sees them (this is how Moodle is monitored) \\
-cAdvisor and node\_exporter & every node & CPU and memory per service and per host \\
-backup service (port 9199) & the backup node & age, size and duration of the last backup; result of the restore test \\
+\texttt{core} & Python Microservice & Requests/sec, posted reviews, Redis cache hit/miss ratio \\
+Nginx Exporter & Frontend Proxy & Active connections, throughput per replica \\
+Postgres Exporter / Patroni & PostgreSQL Nodes & Connection pool, transactions, replication lag, leader status \\
+Redis Exporter & Cache Instances & Master/Replica role, memory consumption, hit ratio \\
+MySQLd Exporter & MariaDB Instance & Active threads, queries per second (QPS) \\
+Blackbox Exporter & Web Endpoints & Availability and HTTP response latency for Moodle/Grafana/App \\
+cAdvisor \& Node Exporter & Host Nodes & Node-level CPU, RAM usage, and container resource limits \\
+Backup Exporter (9199) & Backup Service & Last execution age, duration, archive size, restore status \\
 \bottomrule
 \end{tabularx}
-\caption{Metric sources.}
+\caption{Observability exporters and monitored metrics.}
 \label{tab:obs}
 \end{table}
 
-The dashboard (as code, in git) has rows for overview, containers, nginx, PostgreSQL,
-Redis, MariaDB/Moodle and backups; the queries use \texttt{label\_replace} so the same panel
-works with the swarm and the compose labels of cAdvisor. The Infinity datasource (the ``?'') shows the average and the ratings captured by
-the feeder straight from \texttt{/api/stats}. Rules in \texttt{rules.yml}: target or site
-down, replication lag, Postgres or Redis without exactly one leader/master, old backup, failed restore test.
-Moodle, which has no metrics endpoint, is covered by the probe of its login page and by the
-MariaDB exporter, which draws the arrow Grafana$\to$atenea of the diagram.
+
+Figure~\ref{fig:grafana_dashboard} presents the main Grafana overview dashboard after simulating application traffic generated by user interactions with the reviews app.
+
+
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{grafana_dashboard.png}
+\caption{Grafana monitoring dashboard.}
+\label{fig:grafana_dashboard}
+\end{figure}
+
 
 \section{Security}
 
 \begin{itemize}
-\item Only nginx is exposed; port 80 serves ACME challenges and redirects to HTTPS
-(TLS 1.2/1.3, HSTS). Moodle, Grafana and the app are reached only through it.
-\item \textbf{Database roles with least privilege}: \texttt{app} owns database
-\texttt{app} and \texttt{grafana} owns its own; \texttt{replicator} (created by Patroni) can only replicate;
-\texttt{backup} has \texttt{pg\_read\_all\_data}; \texttt{exporter} has \texttt{pg\_monitor};
-nobody uses the superuser, and \texttt{CONNECT} is revoked from \texttt{PUBLIC}. MariaDB has
-separate read-only \texttt{exporter} and \texttt{backup} accounts.
-\item Passwords are Docker secrets mounted in \texttt{/run/secrets}. All overlay networks
-are encrypted (IPsec) and each stack is isolated in its own network.
-\item The SMTP relay is not published; \texttt{/metrics} is blocked in nginx. The only
-other published page is the mail catcher (\texttt{mail.localhost:8080}), plain HTTP and
-without login, which is acceptable in the laboratory because it only holds notification mails.
-\item Backups are encrypted and verified.
+    \item \textbf{Traffic Control}: Only Nginx exposes external ports ($80/443$). All traffic is forced through TLS 1.2/1.3 with HSTS enabled. Internal microservices remain isolated.
+    \item \textbf{Least-Privilege Database Access}: Database owners (\texttt{app}, \texttt{grafana}) are restricted to their respective databases. The \texttt{replicator} user is confined to replication streams, and global \texttt{CONNECT} rights are revoked from \texttt{PUBLIC}.
+    \item \textbf{Encrypted Inter-Node Communication}: Secrets are mounted in-memory at \texttt{/run/secrets}. Overlay networks utilize IPsec encryption, segregating individual application stacks.
+    \item \textbf{Metrics Isolation}: Metric endpoints (\texttt{/metrics}) are blocked at the proxy layer, preventing external exposure.
 \end{itemize}
+
 \section{Test cases}
 
 Each case says what to do, where to look and what must be seen. Commands are run from the
