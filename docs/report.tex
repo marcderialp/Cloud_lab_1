@@ -457,86 +457,68 @@ P12 & Open Grafana & \texttt{https://grafana.localhost}, dashboard \emph{Lab1}; 
 
 \subsection{Local environment}
 
-The whole stack starts with two commands (\texttt{docker compose pull} and
-\texttt{docker compose up -d}) and in less than a minute the 29 containers are healthy
-(Moodle needs about three minutes the first time, because it installs itself). The
-application works end to end: a review is stored in PostgreSQL, appears at once on the page,
-generates a mail that can be read in Mailpit, and updates the dashboards of Grafana. The
-database and the cache survive the loss of their main node: stopping the PostgreSQL leader
-makes another node take its place in a few seconds (about 3~s if the container is stopped,
-about 28~s if it is killed), and stopping the Redis master promotes its replica; in both
-cases the application keeps accepting reviews and no review is lost. The backup is encrypted
-and the automatic restore test recovers the reviews and the 494 tables of Moodle.
+The stack is started with \texttt{docker compose pull} and \texttt{docker compose up -d},
+and the 29 containers become healthy in under a minute (Moodle takes around three minutes
+on the first run because of its installation). The application works end to end: a new
+review is stored in PostgreSQL, shown on the page, sends a mail visible in Mailpit and
+updates the Grafana dashboards. When the PostgreSQL leader is stopped, another node takes
+over in about 3~s (about 28~s if the container is killed), and stopping the Redis master
+promotes its replica. In both cases reviews are still accepted and none are lost. Backups
+are encrypted, and the automatic restore test recovers the reviews and the 494 Moodle tables.
 
 \subsection{Production environment (\texttt{production.yml})}
 \label{sec:verified}
 
-Production is the same stack spread over seven nodes. It runs on our own computer: the nodes
-are seven Docker-in-Docker containers (\texttt{scripts/sim-swarm.sh}), three of them swarm
-managers. All the services
-reach their replicas and each one is on the node that its label asks for. What we obtained:
+Production runs the same stack on seven nodes, simulated on a single computer with
+Docker-in-Docker containers (\texttt{scripts/sim-swarm.sh}), three of them acting as swarm
+managers. Every service reaches its replica count and is placed on the node given by its
+label. The tests gave the following results:
 \begin{itemize}
-\item \textbf{Entry:} the three sites answer on 443 through both front nodes (self-signed
-certificate) and port 80 redirects; requests are spread over front1/front2 and app1/app2.
-\item \textbf{Loss of a whole node (app2):} swarm detects it in 13~s, a database replica is
-promoted, the page keeps answering and reviews are accepted again once the election ends;
-when the node returns, its database rejoins as a replica without intervention.
-\item \textbf{Loss of a front node:} the other front serves all the sites.
-\item \textbf{Rolling update:} the frontend was replaced replica by replica while a request
-was sent every half second, and none failed.
-\item \textbf{Mail, Atenea and Grafana:} the mail of a new review is listed in
-\texttt{http://mail.localhost:8080}, a course created in Atenea is stored (log and database)
-and both Prometheus replicas see all their targets up.
-\item \textbf{Backups:} made from a database replica on the backup node, encrypted, and the
-restore test passes (reviews and 494 Moodle tables).
+\item The three sites answer on port 443 through both front nodes (self-signed
+certificate), port 80 redirects, and traffic is balanced across front1/front2 and app1/app2.
+\item When app2 is shut down, swarm detects it in 13~s and a database replica is promoted.
+The page stays up and reviews are accepted again after the election. When the node comes
+back, its database rejoins as a replica automatically.
+\item If one front node fails, the other one serves all the sites.
+\item A rolling update of the frontend, with a request every 0.5~s, finished with no
+failed requests.
+\item Review mails appear in \texttt{http://mail.localhost:8080}, courses created in Atenea
+are stored, and both Prometheus replicas see all their targets up.
+\item Backups are taken from a database replica on the backup node, encrypted, and pass
+the restore test.
 \end{itemize}
+
 \section{Limitations}
 
 \begin{itemize}
-\item \textbf{Production is simulated on one computer.} The seven nodes are
-Docker-in-Docker containers, so the behaviour with the latency of separate machines is not
-measured. It is not opened to the Internet and has no public domain: the certificate is
-self-signed (the Let's Encrypt logic is in the stack but stays idle).
-\item \textbf{Quorum.} PostgreSQL and etcd need two of their three nodes; if two fail at the
-same time, writes stop until one returns. The third PostgreSQL node shares its machine with
-the monitoring.
-\item \textbf{Single instances.} MariaDB, the NFS server and the mail catcher have one
-instance (the statement exempts DBMS); losing the atenea node stops Moodle until it returns.
-\item \textbf{Backups} are kept on one disk of one node; there is no off-site copy.
-\item \textbf{Security simplifications of the laboratory.} All the secrets are
-\texttt{groupH} and are committed; NFS uses \texttt{no\_root\_squash} (limited to private
-networks) and its port must be closed in a firewall; the mail catcher has no login.
+\item Production is simulated on one machine, so real network latency between nodes was
+not measured. It is not exposed to the Internet and has no public domain, so the
+certificate is self-signed (the Let's Encrypt configuration is included but unused).
+\item PostgreSQL and etcd need two of their three nodes. If two fail together, writes stop
+until one recovers. The third PostgreSQL node also hosts the monitoring.
+\item MariaDB, the NFS server and the mail catcher run as single instances, so losing the
+atenea node stops Moodle until it returns.
+\item Backups are stored on a single disk with no off-site copy.
+\item For simplicity, all secrets are \texttt{groupH} and are committed to the repository,
+NFS uses \texttt{no\_root\_squash} (restricted to private networks, its port should be
+firewalled) and the mail catcher has no authentication.
 \end{itemize}
 
 \section{Conclusions}
 
-The goal of the project was to turn the infrastructure of a company into a set of small
-services that can be started anywhere with a couple of commands, and to prove that it keeps
-working when something breaks. We have a complete system: a reviews application, a learning
-platform, monitoring, mail and backups, all packaged as images that anyone can download and
-run, on one machine for development or on seven nodes for production.
+We turned a company infrastructure into a set of containerised services that can be
+deployed with a couple of commands, either on one machine for development or on seven
+nodes for production. The system includes the reviews application, Moodle, monitoring,
+mail and encrypted backups, all published as images.
 
-The part that taught us most was not starting the services but making them survive failures.
-In a distributed system the pieces have to find each other, agree on who is in charge and
-recover without anybody touching them, and many of the problems we found appeared only when
-we switched machines off on purpose. Testing those failures from the beginning, and not at
-the end, saved us from believing that something worked just because it had started.
+The hardest part was not getting the services to start but making them tolerate failures:
+service discovery, leader election and automatic recovery. Many issues only showed up when
+we deliberately stopped nodes, so testing failures early was essential. In the final
+system, losing a web server, an application server, the cache or the database leader is
+transparent to the user, and backups are verified by automatic restores.
 
-The result is a system where losing a web server, an application server, the cache or the
-database leader goes unnoticed by the user, and where the data is protected by encrypted
-copies that are checked automatically by restoring them. It is not a public service and it
-keeps some simplifications that a real company would not accept, which are listed in the
-previous section, but the structure is the same one that would be used with real machines:
-the next steps would be to move it to servers with a real domain, to keep a copy of the
-backups outside, and to manage the passwords properly.
-
-\subsection*{Work distribution}
-\begin{tabularx}{\textwidth}{lY}
-Member 1 & basic stack: frontend, cache, Let's Encrypt, NFS \\
-Member 2 & core app and interface, static files, Redis cluster \\
-Member 3 & PostgreSQL cluster (Patroni) and roles, SMTP relay, feeder, backups \\
-Member 4 & Atenea (Moodle, MariaDB) \\
-Member 5 & stats stack, exporters, swarm cluster and documentation \\
-\end{tabularx}
+The deployment still has the simplifications listed above, but its architecture would be
+the same on real hardware. Future work would be deploying it on real servers with a public
+domain, keeping off-site backups and proper secret management.
 
 \end{document}
