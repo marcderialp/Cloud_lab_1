@@ -1,7 +1,5 @@
-# local overrides (the lab secrets in secrets/ are committed on purpose, see README)
 .env
 
-# LaTeX build files: only docs/report.tex and docs/report.pdf are kept
 *.aux
 *.log
 *.out
@@ -18,11 +16,9 @@
 *.synctex.gz
 *.synctex(busy)
 
-# python
 __pycache__/
 *.pyc
 
-# editors and operating system
 .vscode/
 .idea/
 *.swp

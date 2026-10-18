@@ -1,8 +1,3 @@
-# Local environment: docker compose up -d   (images from Docker Hub, --build to build them)
-# No TLS, no NFS, only named volumes. Open http://app.localhost:8080,
-# lms.localhost:8080, grafana.localhost:8080 and mail.localhost:8080 (mailpit)
-# Scale the stateless services with: docker compose up -d --scale core=3
-
 x-moodle: &moodle
   image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:moodle-${TAG:-1.0}
   environment: { MOODLE_URL: "http://lms.localhost:8080" }
@@ -10,14 +5,12 @@ x-moodle: &moodle
   volumes: [ moodledata:/var/moodledata ]
 
 services:
-  # ---------- basic ----------
   frontend:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:frontend-${TAG:-1.0}
     build: ./basic/frontend
     environment: { DOMAIN: localhost, NODE: "", NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates-local }
     ports: [ "8080:80" ]
 
-  # ---------- app ----------
   core:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:core-${TAG:-1.0}
     build: ./app/core
@@ -35,8 +28,6 @@ services:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:static-${TAG:-1.0}
     build: ./app/static
 
-  # postgres: 3 Patroni nodes (leader election in etcd) behind haproxy ("db").
-  # etcd is a single member here; production has three.
   etcd-1:
     image: quay.io/coreos/etcd:v3.5.15
     command: [ etcd, --name=etcd-1, --data-dir=/etcd-data, --listen-client-urls=http://0.0.0.0:2379,
@@ -106,8 +97,6 @@ services:
     secrets: [ backup_db_password, backup_passphrase ]
     volumes: [ backups:/backups, moodledata:/moodledata:ro ]
 
-  # ---------- atenea ----------
-  # only moodle builds the image; moodle-cron reuses it
   moodle:
     <<: *moodle
     build: ./atenea/moodle
@@ -116,7 +105,6 @@ services:
     pull_policy: never
     depends_on: [ moodle ]
     command: sh -c 'while true; do su -s /bin/sh www-data -c "php admin/cli/cron.php"; touch /tmp/cron.alive; sleep 60; done'
-    # the image checks apache, which this container does not run: check the loop instead
     healthcheck: { test: [ CMD-SHELL, "find /tmp/cron.alive -mmin -5 | grep -q ." ], interval: 30s, timeout: 5s, start_period: 600s, retries: 3 }
   moodle-db:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:moodle-db-${TAG:-1.0}
@@ -129,11 +117,10 @@ services:
     secrets: [ moodle_db_password, exporter_db_password, backup_db_password ]
     volumes: [ moodle-db:/var/lib/mysql ]
 
-  # ---------- stats ----------
   grafana:
     image: ${IMAGE_REPO:-omarcornejo/lab1grouph}:grafana-${TAG:-1.0}
     build: ./stats/grafana
-    restart: on-failure  # exits if postgres isn't ready yet
+    restart: on-failure
     environment:
       GF_DATABASE_TYPE: postgres
       GF_DATABASE_HOST: db:5432

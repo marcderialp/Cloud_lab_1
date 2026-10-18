@@ -1,5 +1,3 @@
-"""Every FEED_INTERVAL seconds reads the schema.org rating (JSON-LD) of the
-pages in FEED_URLS and sends it to the core app."""
 import json
 import os
 import re
@@ -24,5 +22,5 @@ while True:
                     print(url, rating)
         except Exception as e:
             print("error with", url, e)
-    open("/tmp/alive", "w").close()  # heartbeat for the healthcheck
+    open("/tmp/alive", "w").close()
     time.sleep(int(os.environ.get("FEED_INTERVAL", "300")))

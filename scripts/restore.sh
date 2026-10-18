@@ -1,12 +1,4 @@
 #!/bin/sh
-# Restores an encrypted backup. Run on the backup node (next to the backup container).
-#   scripts/restore.sh <backup dir, e.g. 20261019-0330> app|grafana|moodle|moodledata [target]
-#   app, grafana -> pg_restore into the postgres primary (default target: db)
-#   moodle       -> into the moodle database          (default target: moodle-db)
-#   moodledata   -> extracts into a directory of the container (default: /restore/moodledata)
-# The tables keep their owner (app, grafana): do not use --no-owner here.
-# The backup role is read only, so restoring needs the admin passwords of the databases
-# (PG_ADMIN_PASSWORD / MOODLE_DB_PASSWORD, default groupH like every secret).
 set -e
 d=$1; what=$2; target=$3
 [ -n "$d" ] && [ -n "$what" ] || { sed -n '2,9p' "$0"; exit 1; }

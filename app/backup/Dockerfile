@@ -1,6 +1,4 @@
 FROM alpine:3.20
-# clients for the dumps, openssl for the encryption and the servers (only used
-# by restore-test.sh, to prove that a backup can really be restored)
 RUN apk add --no-cache postgresql16 postgresql16-client mariadb mariadb-client openssl tar su-exec busybox-extras
 COPY lib.sh backup.sh restore-test.sh entrypoint.sh /
 RUN chmod +x /backup.sh /restore-test.sh /entrypoint.sh

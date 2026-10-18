@@ -1,7 +1,4 @@
 #!/bin/sh
-# Writes the Patroni configuration (passwords come from docker secrets) and starts it.
-# Patroni initialises the first node it finds with an empty cluster, makes the others
-# replicas (pg_basebackup) and promotes one of them if the leader disappears.
 set -e
 NAME=${PATRONI_NAME:-$(hostname)}
 ETCD=${ETCD_HOSTS:-etcd-1:2379,etcd-2:2379,etcd-3:2379}

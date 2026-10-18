@@ -1,9 +1,6 @@
 #!/bin/sh
-# Run once on a manager, after the 7 nodes joined the swarm. The role comes from the
-# node name: front*, app*, stats*, atenea*, backup* (the number of appN is its slot).
-# Or explicitly:  scripts/label-nodes.sh front1=front front2=front app1=app:1 app2=app:2 ...
 set -e
-label() { # node role [slot]
+label() {
     docker node update --label-add role="$2" ${3:+--label-add slot="$3"} "$1" >/dev/null
     echo "$1 -> role=$2${3:+ slot=$3}"
 }
@@ -26,6 +23,5 @@ for n in $(docker node ls --format '{{.Hostname}}'); do
     esac
 done
 
-# the NFS server runs on the atenea node: its private address is what the other nodes mount
 a=$(docker node ls --format '{{.Hostname}}' | grep atenea | head -n1)
-[ -n "$a" ] && echo "export NFS_SERVER=$(docker node inspect "$a" --format '{{.Status.Addr}}')   # private IP of the NFS node (port mode host)"
+[ -n "$a" ] && echo "export NFS_SERVER=$(docker node inspect "$a" --format '{{.Status.Addr}}')"

@@ -2,11 +2,9 @@ resolver 127.0.0.11 valid=10s;
 
 proxy_cache_path /var/cache/nginx/lab1 levels=1:2 keys_zone=lab1:10m max_size=200m inactive=10m use_temp_path=off;
 
-# NODE is the swarm node name; empty (compose) -> container hostname
 map "${NODE}" $node { "" $hostname; default "${NODE}"; }
 map $http_upgrade $connection_upgrade { default upgrade; "" ""; }
 
-# only reachable from inside the container (the metrics exporter)
 server {
     listen 127.0.0.1:8081;
     location = /stub_status { stub_status; }

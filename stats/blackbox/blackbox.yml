@@ -3,6 +3,5 @@ modules:
     prober: http
     timeout: 5s
     http:
-      # moodle answers with a redirect to its public url when the host is internal
       valid_status_codes: [200, 301, 302, 303]
       follow_redirects: false

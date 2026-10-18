@@ -1,6 +1,4 @@
 #!/bin/sh
-# Proves the latest backup: decrypts it, checks the checksums, restores both
-# databases into throw-away servers inside this container and counts the data.
 set -e
 . /env
 . /lib.sh
@@ -26,7 +24,6 @@ echo "testing $latest"
 ( cd "$latest" && sha256sum -c SHA256SUMS )
 dec < "$latest/moodledata.tar.gz.enc" | tar -tzf - > /dev/null
 
-# postgres
 mkdir "$W/pg" && chown postgres "$W/pg" "$W"
 su-exec postgres initdb -D $W/pg -U postgres --auth trust >/dev/null
 su-exec postgres pg_ctl -D $W/pg -w -o "-p 5433 -k $W -c listen_addresses=''" start >/dev/null
@@ -37,7 +34,6 @@ pg_restore -h $W -p 5433 -U postgres --no-owner -d app $W/app.dump
 comments=$(psql -h $W -p 5433 -U postgres -d app -tAc "select count(*) from comments")
 dec < "$latest/grafana.dump.enc" | pg_restore -l >/dev/null
 
-# mariadb
 mkdir "$W/my" && chown mysql "$W/my"
 mariadb-install-db --user=mysql --datadir=$W/my --skip-test-db >/dev/null
 su-exec mysql mariadbd --datadir=$W/my --socket=$W/my/my.sock --skip-networking --pid-file=$W/my/my.pid &

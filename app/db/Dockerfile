@@ -1,4 +1,3 @@
-# PostgreSQL 16 (alpine) managed by Patroni: leader election in etcd, automatic failover
 FROM postgres:16-alpine
 RUN apk add --no-cache python3 py3-pip curl su-exec \
     && python3 -m venv /opt/patroni \
