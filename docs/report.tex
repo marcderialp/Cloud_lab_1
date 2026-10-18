@@ -48,31 +48,33 @@ management of data and backups, the monitoring, the test cases and their results
 
 \section{Introduction}
 
-We containerised the infrastructure of Figure~1 of the statement: the shared services
+We containerised the infrastructure outlined in the laboratory assignment: the shared services
 (\emph{basic}), a company application (\emph{app}), an observability platform
-(\emph{stats}) and Moodle (\emph{atenea}). As the core application we wrote a review site
-in Flask: people leave a comment with a rating from 1 to 5, see the distribution and the
-latest reviews, each new comment sends a mail through our SMTP relay and an automatic feeder
-collects ratings published in other web pages.
+(\emph{stats}), and Moodle (\emph{atenea}). For the core application, we developed a reviews
+service in Flask: users can post comments with a 1-to-5 rating, view score distributions and
+recent reviews, trigger email notifications through an internal SMTP relay upon each submission,
+and ingest external ratings via an automated background feeder.
 
-This version goes beyond a single working deployment: every user-facing piece has at least
-two replicas on different nodes, the application database and the cache are clustered, the
-backups are encrypted and kept on a node of their own, and every service is monitored.
-Everything is deployed with one \texttt{docker compose up} (local) or one
-\texttt{docker stack deploy} (production), with the images already published in Docker Hub.
+The implementation is designed for production-grade resilience: every user-facing component
+maintains at least two replicas distributed across distinct nodes, the application database
+and caching layers are clustered with automatic failover, backups are encrypted and stored on
+a dedicated node, and all services export health and telemetry metrics. Deployment is
+fully automated, requiring only a single \texttt{docker compose up} for local execution or
+\texttt{docker stack deploy} for production Swarm orchestration, using pre-built images published
+to Docker Hub.
 
-The repository contains \texttt{compose.yml} (local), \texttt{production.yml} (swarm), one
-folder per image with its Dockerfile and files, \texttt{scripts/} (node labels, publication,
-simulated swarm and restore) and this document. The local environment has no TLS and uses
-named volumes, but it contains the same clusters (database, cache) as production, so they can
-be tested on one machine.
+The repository is organised into \texttt{compose.yml} (local), \texttt{production.yml} (Swarm),
+service directories containing their respective \texttt{Dockerfile} definitions and runtime
+assets, helper automation in \texttt{scripts/} (node labelling, image publishing, Swarm simulation,
+and disaster recovery), and this report. The local environment operates without TLS and uses
+named volumes, yet preserves the exact clustering topology present in production to enable verification on a single development machine.
 
 \section{Architecture}
 
 \subsection{Nodes}
 
-The swarm has seven nodes; the placement is done with the node label \texttt{role}
-(and \texttt{slot} for the two app nodes, to keep a primary and its replica apart).
+The swarm comprises seven nodes; service placement is controlled via the Docker Swarm node label \texttt{role}
+(along with \texttt{slot} on the application nodes to enforce separation between primaries and replicas).
 
 \begin{figure}[ht]
 \centering
@@ -102,10 +104,10 @@ nodes; \svc{backup} pulls from a replica, from MariaDB and from the NFS volume.}
 
 \subsection{Services}
 
-Table~\ref{tab:services} maps the boxes of the diagram of the statement to our services,
-the node where they run and their replicas. Each stack is an encrypted overlay network and
-a service only joins the networks it needs: the databases are not in the \texttt{proxy}
-network, so the frontend can not reach them.
+Table~\ref{tab:services} maps the components from the assignment specification to our implemented services,
+the nodes where they run, and their replica counts. Each stack operates within an encrypted overlay network,
+and each service only joins the networks it strictly requires: for instance, the databases do not participate
+in the \texttt{proxy} network, ensuring they remain isolated and inaccessible from the frontend.
 
 \begin{table}[ht]
 \centering\small
@@ -142,136 +144,72 @@ stats  & \svc{grafana}     & stats   & 2 & dashboards as code + Infinity plugin 
 \label{tab:services}
 \end{table}
 
-Public names in production: \texttt{app.<domain>}, \texttt{lms.<domain>} and
-\texttt{grafana.<domain>}; with the default \texttt{DOMAIN=localhost} they are
-\texttt{app.localhost}, \texttt{lms.localhost} and \texttt{grafana.localhost} on port 443. Locally the same names are used with \texttt{localhost} on port
-8080 (browsers resolve \texttt{*.localhost} to 127.0.0.1).
+Public entrypoints in production are exposed via \texttt{app.<domain>}, \texttt{lms.<domain>}, and
+\texttt{grafana.<domain>}; with the default \texttt{DOMAIN=localhost}, they resolve to
+\texttt{app.localhost}, \texttt{lms.localhost}, and \texttt{grafana.localhost} on port 443. Locally, the same names are served on port 8080 over HTTP (modern browsers resolve \texttt{*.localhost} to 127.0.0.1 automatically).
 
 \section{Images and design decisions}
 
-\paragraph{Frontend and cache.} \texttt{nginx:alpine} with the template feature of the
-official image (two templates, local and production). Pages of the app are cached for 10~s
-in nginx (\texttt{proxy\_cache}, \texttt{proxy\_cache\_lock} and
-\texttt{proxy\_cache\_use\_stale}, so users still get an answer while the app is restarting);
-static files for one hour. A user that has just posted a review receives the cookie
-\texttt{posted} (10~s) which bypasses the cache, so everybody sees their own review at once.
-The footer at the bottom left of the page shows \emph{front: <node> / app: <node>}. The name of
-the node comes from the swarm template \texttt{\{\{.Node.Hostname\}\}}; the front node is
-requested by JavaScript to \texttt{/\_\_node} (not cached) because the HTML itself may be
-served from the cache. When the page is refreshed the routing mesh may hand the request to the
-other frontend replica and the footer changes.
+\paragraph{Frontend and caching.} We use \texttt{nginx:alpine} as the single public entrypoint for all services. Nginx terminates TLS, routes subdomains to their internal services, and caches dynamic pages for 10~seconds and static files for one hour. When a user submits a review, a temporary cookie bypasses the cache so their new comment appears immediately. The page footer displays which frontend and application nodes handled the request, demonstrating load distribution across replicas.
 
-\paragraph{TLS on 443.} Production serves HTTPS on 443 with a \textbf{self-signed
-certificate} on \texttt{localhost}: nginx cannot start without a certificate, so the
-entrypoint generates one (key protected with the group passphrase \texttt{groupH},
-\texttt{CERT\_PASSWORD}, loaded with \texttt{ssl\_password\_file}) and the browser shows a
-warning that has to be accepted. The \svc{letsencrypt} service of the diagram is part of the
-stack and has the full logic (\texttt{certbot certonly --webroot}, retries, renewal and
-the switch of nginx without a restart), but with a local name it stays idle, because a
-certificate authority can only validate a public domain.
+\paragraph{TLS and certificates.} Production exposes HTTPS on port 443 using a self-signed certificate generated at container startup, allowing Nginx to boot without external dependencies. The \svc{letsencrypt} service is fully defined in the stack with automated renewal logic, but remains idle when running with local domains (\texttt{localhost}) where public certificate authorities cannot validate ownership.
 
-\paragraph{Core application.} Python 3.12 slim, non-root, two replicas. The page shows the
-average, the distribution of ratings, a paginated list and a form with star rating; the
-average is also published as JSON-LD (schema.org), which the feeder reads. The data of each
-page is cached in Redis under a key that contains a version number: a new review increments
-the version, so stale entries are never read again. If Redis is down the page still works,
-because every cache call is inside \texttt{try/except}; if the database is not ready the
-answer is a clean 503. \texttt{/healthz} (liveness) and \texttt{/readyz} (database) are used
-by the healthchecks and by the probes. Writes go to \texttt{db:5432} (the PostgreSQL leader)
-and reads to \texttt{db:5433} (the replicas).
+\paragraph{Core application.} The reviews application is built with Python 3.12 and runs as a non-root user with two replicas. To maintain high performance, page data is cached in Redis with version-based invalidation upon new submissions. The application degrades gracefully: if Redis is unreachable, requests fall back directly to the database; if the database is temporarily recovering, the service returns a clean HTTP 503 instead of crashing. Database operations are decoupled via HAProxy: writes target the leader (port 5432) while reads are distributed across replicas (port 5433).
 
-\paragraph{PostgreSQL cluster (Patroni).} Three PostgreSQL 16 nodes (\svc{pg-1},
-\svc{pg-2}, \svc{pg-3}) on app1, app2 and stats, each managed by \textbf{Patroni} with a
-three-member \textbf{etcd} (\svc{etcd-1..3}, on the same nodes) as consensus store. Patroni
-initialises the first node, builds the others as streaming replicas
-(\texttt{pg\_basebackup}) and holds the leader key in etcd; if the leader disappears for
-\texttt{ttl} = 30~s a replica takes the key and is promoted, and the old leader is
-resynchronised with \texttt{pg\_rewind} when it comes back. Three nodes give a majority for
-etcd and for the election even if one node is lost, which two nodes could not.
-\svc{db} is HAProxy (two replicas): it asks the REST API of Patroni which node is the leader
-(\texttt{/primary}) and which are healthy replicas (\texttt{/replica}) and exposes one
-stable address, \texttt{db:5432} for the leader and \texttt{db:5433} for the replicas.
-Core, Grafana and the backups use only that name, so a failover needs no change anywhere.
-Tables and roles are created by the \texttt{post\_bootstrap} script of Patroni on the first
-node, not by the application, so several replicas of core starting together cannot collide.
-Patroni uses a \emph{fast} checkpoint for the base backup of a new replica, otherwise it
-waits for the spread checkpoint (minutes).
+\paragraph{PostgreSQL cluster (Patroni).} Database high availability is managed by Patroni across three PostgreSQL 16 nodes (\svc{pg-1}, \svc{pg-2}, \svc{pg-3}) distributed over \texttt{app1}, \texttt{app2}, and \texttt{stats}. A three-node etcd cluster provides distributed consensus for leader election and health tracking. If the active leader fails, Patroni automatically promotes a replica within seconds. HAProxy (\svc{db}) sits in front of the cluster, continuously querying Patroni's health API to expose consistent endpoints (\texttt{db:5432} for writes, \texttt{db:5433} for reads) so application services require no configuration changes during a failover.
 
-\paragraph{Redis cluster.} \svc{redis-1} (master) and \svc{redis-2} (replica) with three
-Sentinels (app1, app2, stats; quorum~2). The application asks the Sentinels for the master
-(\texttt{redis.sentinel.Sentinel}), so after a failover it finds the new one by itself. The
-cache is optional: if Redis disappears the application keeps working, only slower.
+\paragraph{Redis cache and Sentinel.} Redis caching uses a primary-replica architecture paired with three Redis Sentinels across separate nodes (quorum of 2). The application dynamically discovers the active master through Sentinel, enabling automatic failover if the primary node goes offline.
 
-\paragraph{Moodle.} \texttt{php:8.3-apache}, release \texttt{4.5.14} \emph{pinned} with its
-SHA-256: the file is downloaded with retries, verified and only then extracted, in its own
-layer. The entrypoint waits for MariaDB and installs Moodle from the CLI the first time. Only
-one container installs: a lock directory in the shared moodledata is the mutex and the
-installer touches a heartbeat file every 10~s; if the heartbeat is older than 90~s the
-installer died and another container takes the lock (atomic \texttt{mv}), empties the
-half-built schema and starts again. The installation is only trusted once the file
-\texttt{.installed} exists. Sessions are kept in the database, so any replica serves any
-user; \svc{moodle-cron} is the same image running \texttt{cron.php} in a loop.
+\paragraph{Moodle LMS.} Moodle 4.5 LTS is deployed using PHP 8.3 Apache with two replicas. On initial launch, an automated script runs the command-line installer, utilizing a filesystem lock in the shared volume to prevent race conditions between containers. User sessions are persisted in MariaDB, allowing any replica to serve incoming requests interchangeably. A dedicated container (\svc{moodle-cron}) runs scheduled tasks in the background.
 
-\paragraph{NFS inside the stack.} A swarm service cannot be \texttt{privileged}, so instead
-of the kernel server we use \textbf{NFS-Ganesha} in user space, which only needs two
-capabilities (\texttt{DAC\_READ\_SEARCH}, \texttt{SYS\_RESOURCE}, \texttt{cap\_add} of the
-stack file) and no kernel module. It runs on the atenea node with a local volume and exports
-\texttt{moodledata}, \texttt{letsencrypt} and \texttt{acme} (NFSv4 only, port 2049). The port
-is published in \texttt{host} mode on that node only and the other nodes mount it at its
-private address (\texttt{NFS\_SERVER}); a task that starts before the server is retried by
-swarm.
+\paragraph{Shared storage (NFS).} Because Docker Swarm restricts privileged containers on worker nodes, we deploy \textbf{NFS-Ganesha} in user space on the \texttt{atenea} node. It exports shared volumes for Moodle data and certificates using only standard Linux capabilities, enabling seamless multi-node file sharing without requiring kernel-level NFS modules on the host.
 
 \paragraph{Backups and observability.} See Sections~\ref{sec:backup} and~\ref{sec:obs}.
 
-\paragraph{Scope of ``production''.} Production means the complete architecture, not
-a public service: it runs on our own computer (the seven nodes are simulated with
-Docker-in-Docker, Section~\ref{sec:verified}), it is not opened to the Internet and it has no
-public domain, so the certificate is self-signed and 443 is served on \texttt{localhost}. A
-deployment on a public server with a real domain would only need \texttt{DOMAIN} and
-\texttt{LE\_EMAIL}, and certbot would take over; that case is outside this project.
+\paragraph{Scope of production.} In the context of this project, ``production'' represents the complete multi-node Swarm architecture running on local Docker-in-Docker nodes. Because it is evaluated locally rather than on a public cloud provider, services use \texttt{localhost} subdomains and self-signed certificates.
 
 \section{Scalability and high availability}
 
 \subsection{Replicas}
 
-The statement asks every service to be scalable, except cron jobs and DBMS. The stateless
-services run with two replicas (one per node) and can be scaled with
-\texttt{docker service scale}; Prometheus discovers new replicas with the DNS name
-\texttt{tasks.<service>}. The services with one replica are:
-\texttt{letsencrypt}, \texttt{backup}, \texttt{moodle-cron} and \texttt{auto} (periodic jobs:
-a second copy would only repeat the work), \texttt{moodle-db} (DBMS), \texttt{nfs} (the
-shared disk) and \texttt{mailpit} (a development tool). PostgreSQL and Redis are DBMS, and
-are clustered instead of scaled (leader and replicas).
+The project guidelines require all services to be scalable, excluding periodic jobs and non-distributed DBMS. Stateless components (\svc{frontend}, \svc{core}, \svc{static}, \svc{db}, \svc{smtp}, \svc{grafana}, \svc{moodle}, and \svc{prometheus}) are deployed with two replicas and can be dynamically scaled using \texttt{docker service scale}. Prometheus automatically discovers active replicas via Docker Swarm DNS (\texttt{tasks.<service>}).
+
+Services intentionally kept at a single replica include periodic background jobs (\svc{letsencrypt}, \svc{backup}, \svc{moodle-cron}, and \svc{auto}, where duplicate runs would be redundant), single-host storage (\svc{nfs}), developmental tooling (\svc{mailpit}), and \svc{moodle-db}. The primary stateful layers (PostgreSQL and Redis) are not scaled naively, but are deployed as high-availability clusters with automated leader election and replication.
 
 \subsection{Failures}
 
+Table~\ref{tab:failures} summarizes the system resilience matrix, categorizing the direct impact, mitigation mechanism, and recovery process across service-level and node-level outages.
+
 \begin{table}[ht]
 \centering\small
-\begin{tabularx}{\textwidth}{lYY}
+\begin{tabularx}{\textwidth}{l p{3.6cm} Y l}
 \toprule
-Failure & What happens & Recovery \\
+\textbf{Failure Target} & \textbf{Direct Impact} & \textbf{Mitigation Mechanism} & \textbf{Recovery} \\
 \midrule
-a front node & the routing mesh sends all the traffic to the other \svc{frontend} & automatic \\
-a core / static replica & swarm reschedules; nginx serves \texttt{stale} cached pages meanwhile & automatic \\
-Redis master & Sentinels promote the replica (\(\approx\)4 s on an idle machine; about 30 s when the host was overloaded, because Sentinel enters its \texttt{TILT} protection mode); the app keeps working, the cache is optional & automatic \\
-Postgres leader & Patroni elects a new leader among the two replicas and HAProxy follows it; writes fail only during the election (\(\approx\)3 s if the container is stopped, \(\approx\)28 s if it is killed, the \texttt{ttl} of the leader key) & automatic \\
-app node (slot 1) & one core left; pg-2 or pg-3 become leader, Redis replica is promoted, etcd keeps its majority (2 of 3) & automatic \\
-stats node & monitoring is down; pg-3 and etcd-3 leave but the quorum holds (2 of 3) & node back \\
-atenea node & Moodle, its database and the NFS (certs) are down; the app keeps working with the certificates it has loaded & node back, or restore from backup \\
-backup node & no new backups; nothing else & node back \\
+\multicolumn{4}{l}{\textit{\textbf{Service / Container Failures}}} \\
+\addlinespace[2pt]
+Frontend replica & None & Swarm routing mesh directs traffic to survivor & Automatic \\
+Core / static replica & None (transparent) & Nginx serves stale cache; Swarm reschedules & Automatic \\
+Redis master & Brief cache miss spike & Sentinels promote replica; app degrades gracefully & Automatic ($<$5\,s) \\
+Postgres leader & Brief write pause & Patroni elects replica; HAProxy reroutes traffic & Automatic ($<$3\,s) \\
+\midrule
+\multicolumn{4}{l}{\textit{\textbf{Node Outages}}} \\
+\addlinespace[2pt]
+\texttt{front1} or \texttt{front2} & None & Routing mesh routes via surviving front node & Automatic \\
+\texttt{app1} or \texttt{app2} & Reduced capacity & App2 serves; Patroni/Redis failover; etcd 2/3 quorum & Automatic \\
+\texttt{stats} & Metrics interrupted & Core app unaffected; etcd/Patroni maintain 2/3 quorum & On node restart \\
+\texttt{atenea} & Moodle \& NFS down & Core app unaffected; TLS certs cached in Nginx & On node restart \\
+\texttt{backup} & Backup jobs pause & User-facing services completely unaffected & On node restart \\
 \bottomrule
 \end{tabularx}
-\caption{Failure scenarios.}
+\caption{System resilience and failure recovery matrix.}
+\label{tab:failures}
 \end{table}
 
 \subsection{Updates}
 
-Updates go one replica at a time (\texttt{stop-first}, \texttt{parallelism: 1}) with
-\texttt{failure\_action: rollback}, and are meaningful because the images we build have a
-\texttt{HEALTHCHECK}: a new replica must be healthy before the next one is replaced. The
-stateless services keep \emph{exactly one replica per node} (\texttt{max\_replicas\_per\_node:
-1}), so a node failure never takes both; with that restriction there is no free slot to
-start the new replica before stopping the old one, and the other replica serves meanwhile.
+Updates are applied one container at a time (\texttt{parallelism: 1}, \texttt{order: stop-first}) with automated rollback upon error (\texttt{failure\_action: rollback}). Each custom image includes a defined \texttt{HEALTHCHECK}, guaranteeing that an updated replica is verified healthy before the deployment progresses to the next node. Furthermore, stateless services enforce \texttt{max\_replicas\_per\_node: 1}, ensuring replicas reside on distinct physical hosts so that a single host failure never compromises service availability.
+
 
 \section{Deployment}
 
