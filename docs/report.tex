@@ -192,13 +192,13 @@ Table~\ref{tab:failures} summarizes the system resilience matrix, categorizing t
 \addlinespace[2pt]
 Frontend replica & None & Swarm routing mesh directs traffic to survivor & Automatic \\
 Core / static replica & None (transparent) & Nginx serves stale cache; Swarm reschedules & Automatic \\
-Redis master & Brief cache miss spike & Sentinels promote replica; app degrades gracefully & Automatic ($<$5\,s) \\
-Postgres leader & Brief write pause & Patroni elects replica; HAProxy reroutes traffic & Automatic ($<$3\,s) \\
+Redis master & Brief cache miss spike & Sentinels promote replica; app degrades gracefully & Automatic ($\approx$7--12\,s) \\
+Postgres leader & Writes pause until the election & Patroni elects replica; HAProxy reroutes traffic & Automatic ($\approx$30\,s) \\
 \midrule
 \multicolumn{4}{l}{\textit{\textbf{Node Outages}}} \\
 \addlinespace[2pt]
 \texttt{front1} or \texttt{front2} & None & Routing mesh routes via surviving front node & Automatic \\
-\texttt{app1} or \texttt{app2} & Reduced capacity & App2 serves; Patroni/Redis failover; etcd 2/3 quorum & Automatic \\
+\texttt{app1} or \texttt{app2} & Reduced capacity & Other app node serves; Patroni/Redis failover; etcd 2/3 quorum & Automatic \\
 \texttt{stats} & Metrics interrupted & Core app unaffected; etcd/Patroni maintain 2/3 quorum & On node restart \\
 \texttt{atenea} & Moodle \& NFS down & Core app unaffected; TLS certs cached in Nginx & On node restart \\
 \texttt{backup} & Backup jobs pause & User-facing services completely unaffected & On node restart \\
@@ -330,7 +330,7 @@ and application accessible at \texttt{https://app.localhost}.}
 
 In this section, we focused on showing how we deployed both
 environments and how we organized the infrastructure.
-We cover the functional tests, scalability and failure recovery
+We cover failure recovery, backups and scalability
 in Section~\ref{sec:test-cases}.
 
 \FloatBarrier
@@ -429,6 +429,8 @@ Backups are initially written with a \texttt{.partial} suffix and atomic-renamed
 
 An automated integrity check runs every Sunday (and on demand with \texttt{docker exec <backup> /restore-test.sh}). The routine verifies checksums, decrypts archives, restores dumps into temporary containerized DBMS instances, and validates recovered row and table counts. Test outcomes are exported to Prometheus (\texttt{backup\_restore\_test\_ok}).
 
+To recover data, \texttt{scripts/restore.sh <folder> app|grafana|moodle|moodledata} is run on the backup node: it decrypts the chosen file of a backup folder and loads it into the live service (for PostgreSQL, through \texttt{db:5432}, that is, into the current leader).
+
 
 \section{Observability}
 \label{sec:obs}
@@ -479,97 +481,204 @@ Figure~\ref{fig:grafana_dashboard} presents the main Grafana overview dashboard 
 \section{Test cases}
 \label{sec:test-cases}
 
-Each case says what to do, where to look and what must be seen. Commands are run from the
-project folder (local environment) or on the manager node, \texttt{front1} (production,
-\texttt{docker exec front1 \ldots}).
+The basic functionality (reviews, mails, Moodle and monitoring) is already shown in the
+previous sections, so here we focus on what happens when something fails, on backups and on
+scaling. Every test was run on a clean deployment, first locally and then in production,
+and in every case we checked that the reviews application kept working.
+Table~\ref{tab:tests} summarises them; the commands and the important lines of their
+output follow.
+
+\begin{table}[H]
+\centering\small
+\begin{tabularx}{\textwidth}{@{}llYl@{}}
+\toprule
+\textbf{\#} & \textbf{Test} & \textbf{What we expect} & \textbf{Result} \\
+\midrule
+L1 & Database leader crashes & another node becomes leader, no review is lost & passed (30~s) \\
+L2 & Cache master stops & the replica becomes master, the page keeps working & passed (12~s) \\
+L3 & Backup and restore test & the backup can really be restored & passed \\
+L4 & Three app replicas & traffic is shared among the three & passed \\
+\midrule
+P1 & A whole node goes down & the site stays up, the database elects a leader & passed (31~s) \\
+P2 & Cache master is killed & the three Sentinels promote the replica & passed (7~s) \\
+P3 & Restore the database & data goes back to the moment of the backup & passed \\
+\bottomrule
+\end{tabularx}
+\caption{Test cases and results.}
+\label{tab:tests}
+\end{table}
 
 \subsection{Local environment}
 
-\begin{footnotesize}
-\begin{longtable}{@{}p{0.7cm}>{\raggedright\arraybackslash}p{3.5cm}>{\raggedright\arraybackslash}p{5.4cm}>{\raggedright\arraybackslash}p{4.8cm}@{}}
-\caption{Test cases of the local environment.}\\
-\toprule
- & What we do & Where we look & Expected \\
-\midrule
-\endfirsthead
-\toprule
- & What we do & Where we look & Expected \\
-\midrule
-\endhead
-L1 & Publish a review in \texttt{app.localhost:8080} & \texttt{docker compose logs core | grep "POST /comment"} & status \texttt{302}; the review appears at the top and the counter grows \\
-L2 & (same review) & \texttt{docker compose logs smtp | grep status=sent}; page \texttt{mail.localhost:8080} & \texttt{status=sent}, and the mail ``New review (n/5)'' is listed \\
-L3 & Create a course in Atenea as \texttt{admin} (Site administration $\to$ Courses) & \texttt{docker compose logs moodle | grep "POST /course/edit.php"}; \texttt{docker compose exec moodle-db mariadb -umoodle -pgroupH moodle -e "select shortname from mdl\_course"} & \texttt{303}; the course is in the table \\
-L4 & Stop the Postgres leader: \texttt{docker compose kill pg-1} (the leader) & \texttt{docker compose exec pg-2 patronictl -c /etc/patroni.yml list}; \texttt{docker compose logs pg-2 | grep promoted} & another node is \emph{Leader}; ``promoted self to leader''; a new review is still accepted \\
-L5 & Stop the Redis master: \texttt{docker compose stop redis-1} & \texttt{docker compose logs sentinel | grep switch-master} & \texttt{+switch-master mymaster redis-1 6379 redis-2 6379}; the page keeps working \\
-L6 & Backup and restore test & \texttt{docker compose exec backup /backup.sh}; \texttt{docker compose exec backup /restore-test.sh} & \texttt{backup ok: /backups/\ldots}; \texttt{restore test ok: n comments, 494 moodle tables} \\
-L7 & More replicas: \texttt{docker compose up -d --scale core=3} & several requests; header \texttt{X-App-Node} & the node name changes between requests \\
-L8 & Open Grafana, dashboard \emph{Lab1} & panels of PostgreSQL, Redis, nginx, backups & data in every panel; one Patroni node with value 1 \\
-\bottomrule
-\end{longtable}
-\end{footnotesize}
+\subsubsection*{L1: The database leader crashes}
+
+We looked at which PostgreSQL node was the leader (\svc{pg-3}), published two reviews and
+killed it as if it had crashed.
+\begin{lstlisting}
+$ docker compose kill pg-3
+$ docker compose logs pg-1 pg-2 | grep promoted
+pg-2 | 14:09:18 INFO: promoted self to leader by acquiring session lock
+$ docker compose exec pg-1 patronictl -c /etc/patroni.yml list
+| pg-1 | Replica | streaming | TL 2 |
+| pg-2 | Leader  | running   | TL 2 |
+| pg-3 | Replica | streaming | TL 2 |      # after starting it again
+\end{lstlisting}
+After about 30~s (the time the leader has to renew its lock) \svc{pg-2} became the new
+leader. The application did not notice it, because it always connects through HAProxy,
+which follows the leader. Two more reviews were published after the failure and all four
+were in the table. When \svc{pg-3} was started again it caught up with the new leader and
+came back as a replica by itself.
+
+\subsubsection*{L2: The cache master stops}
+
+\svc{redis-1} was the Redis master and \svc{redis-2} its replica. We stopped the master.
+\begin{lstlisting}
+$ docker compose stop redis-1
+$ docker compose logs sentinel | grep switch-master
+14:22:23 +switch-master mymaster redis-1 6379 redis-2 6379
+$ docker compose start redis-1
+$ docker compose exec redis-1 redis-cli info replication
+role:slave
+master_host:redis-2
+\end{lstlisting}
+Sentinel noticed the failure after 5~s and made \svc{redis-2} the new master about 7~s
+later. Meanwhile the page kept loading and accepted a review, since the application asks
+Sentinel where the master is and can work without cache. When \svc{redis-1} came back,
+Sentinel turned it into a replica of the new master.
+
+\subsubsection*{L3: Backup and restore test}
+
+We counted the reviews (6), took a backup by hand and ran the restore test on it.
+\begin{lstlisting}
+$ docker compose exec backup /backup.sh
+backup ok: /backups/20261018-1426 (474910 bytes, source: db:5433)
+$ docker compose exec backup /restore-test.sh
+app.dump.enc: OK            grafana.dump.enc: OK
+moodle.sql.gz.enc: OK       moodledata.tar.gz.enc: OK
+restore test ok: 6 comments, 494 moodle tables
+\end{lstlisting}
+The backup was read from a replica (\texttt{db:5433}), so it did not load the leader, and
+it contains the encrypted copies of the two PostgreSQL databases, the Moodle database and
+moodledata. The restore test checked the files, decrypted them and loaded them into
+temporary databases: it got back the same 6 reviews and the 494 Moodle tables, so the
+backup is not only present but usable.
+
+\subsubsection*{L4: Three replicas of the application}
+
+We scaled the application to three replicas and sent 12 requests (skipping the nginx
+cache, so that each one really reaches the application).
+\begin{lstlisting}
+$ docker compose up -d --scale core=3
+$ for i in $(seq 12); do curl ... | grep x-app-node; done | sort | uniq -c
+      6 X-App-Node: 3296c6cf48d3
+      2 X-App-Node: 7ad5cb8834d9      # the new replica
+      4 X-App-Node: f8a2281d16e7
+\end{lstlisting}
+The new replica started receiving requests a few seconds after it was created, without
+restarting nginx, because nginx looks up the name \texttt{core} again every 10~s. This is
+possible because the application keeps no data of its own: reviews are in PostgreSQL and
+the cache in Redis. Going back to two replicas did not affect the page.
 
 \subsection{Production environment}
 
-\begin{footnotesize}
-\begin{longtable}{@{}p{0.7cm}>{\raggedright\arraybackslash}p{3.5cm}>{\raggedright\arraybackslash}p{5.4cm}>{\raggedright\arraybackslash}p{4.8cm}@{}}
-\caption{Test cases of the production environment.}\\
-\toprule
- & What we do & Where we look & Expected \\
-\midrule
-\endfirsthead
-\toprule
- & What we do & Where we look & Expected \\
-\midrule
-\endhead
-P1 & Deploy the stack & \texttt{docker node ls}; \texttt{docker service ls}; \texttt{docker stack ps lab1} & 7 nodes \emph{Ready}; every service at its replicas; each task on its node \\
-P2 & Open \texttt{https://app.localhost} & browser; \texttt{curl -k -D- https://app.localhost/} & the page loads after accepting the certificate; \texttt{X-Front-Node} and \texttt{X-App-Node} alternate between requests \\
-P3 & Publish a review & \texttt{docker service logs lab1\_core | grep "POST /comment"} & \texttt{POST /comment ... 302} on one of the two core replicas \\
-P4 & (same review) & \texttt{http://mail.localhost:8080}; \texttt{docker service logs lab1\_smtp | grep status=sent} & the mail is listed; \texttt{relay=mailpit[...]:1025 ... status=sent} \\
-P5 & Create a course in Atenea & \texttt{https://lms.localhost}; \texttt{docker service logs lab1\_moodle | grep course/edit.php}; table \texttt{mdl\_course} in the \texttt{lab1\_moodle-db} container & \texttt{POST /course/edit.php ... 303}; new row (for example \texttt{PRUEBA1}) \\
-P6 & Lose a whole node: \texttt{docker stop app2} & \texttt{docker node ls}; \texttt{patronictl list}; \texttt{curl -k https://app.localhost/} & \texttt{app2} \emph{Down} in $\approx$13~s; a replica becomes leader; the page answers 200 and a new review is accepted after the election (at most the 30~s \texttt{ttl}) \\
-P7 & Kill the Postgres leader container: \texttt{docker kill <pg-N container>} & \texttt{docker service logs lab1\_pg-N | grep promoted}; \texttt{patronictl list} & ``promoted self to leader because I had the session lock''; timeline (TL) grows by one; swarm restarts the container as a replica; no review is lost \\
-P8 & Kill the Redis master container & \texttt{docker service logs lab1\_sentinel-1 | grep switch-master} & \texttt{+switch-master mymaster redis-1 6379 redis-2 6379} in about 2~s; the page keeps working \\
-P9 & Rolling update: \texttt{docker service update --force lab1\_frontend} & a request every half second to \texttt{https://app.localhost/} & replicas replaced one by one; no request fails \\
-P10 & Backup on the backup node & \texttt{docker exec <lab1\_backup container> /backup.sh} and \texttt{/restore-test.sh} & \texttt{backup ok ... source: db:5433}; \texttt{restore test ok} \\
-P11 & Restore the application database from a backup & write a review after the backup, then \texttt{scripts/restore.sh <folder> app} on the backup node; count the reviews & the review written after the backup disappears and the earlier ones are back; the tables keep their owner and the application keeps working \\
-P12 & Open Grafana & \texttt{https://grafana.localhost}, dashboard \emph{Lab1}; Prometheus on the stats and backup nodes & 36 targets \emph{UP} in each Prometheus; panels with data \\
-\bottomrule
-\end{longtable}
-\end{footnotesize}
+In production the commands run inside the simulated nodes (\texttt{docker exec <node>
+\ldots}); \texttt{pctl}, \texttt{sent} and \texttt{pcount} are short helpers that run
+\texttt{patronictl}, the Sentinel client and a count of reviews in a node that is not
+affected by the test.
+
+\subsubsection*{P1: A whole node goes down}
+
+The node \texttt{app2} runs one replica of the application and one member of each cluster
+(PostgreSQL, Redis, etcd and Sentinel). To also test the election, we first moved the
+database leadership to \svc{pg-2}, on that node, and then switched the node off.
+\begin{lstlisting}
+$ pctl switchover --leader pg-3 --candidate pg-2 --force
+$ docker stop app2                      # 14:45:58
+$ docker exec front1 docker node ls
+app2       Down      Active
+$ pctl list
+| pg-1 | Leader  | running | TL 3 |      # promoted at 14:46:29
+| pg-3 | Replica | running | TL 2 |
+$ curl -sk -o /dev/null -w '%{http_code}\n' https://app.localhost/
+200
+\end{lstlisting}
+Swarm saw the node as \emph{Down} within seconds and 31~s after the stop \svc{pg-1} became
+the leader; the two surviving etcd members are still a majority, which is what allows the
+election. The page answered all the time through the application replica on
+\texttt{app1}, and a review published after the election was saved. When \texttt{app2}
+was switched on again, swarm restarted its containers and \svc{pg-2} rejoined as a
+replica.
+
+\subsubsection*{P2: The cache master is killed}
+
+The Redis master was \svc{redis-1} on \texttt{app1}, with three Sentinels on
+\texttt{app1}, \texttt{app2} and \texttt{stats}. We killed the container.
+\begin{lstlisting}
+$ docker exec app1 sh -c 'docker kill $(docker ps -qf name=lab1_redis-1)'
+                                        # 14:52:13
+$ docker exec front1 docker service logs --raw lab1_sentinel-1 | grep -E ...
+14:52:18 +odown master mymaster redis-1 6379 #quorum 2/2
+14:52:20 +switch-master mymaster redis-1 6379 redis-2 6379
+$ sent sentinel get-master-addr-by-name mymaster
+redis-2
+\end{lstlisting}
+The three Sentinels agreed that the master was down 5~s after the kill and \svc{redis-2}
+was promoted 1~s later, about 7~s in total. The page kept answering and accepted a review.
+Swarm restarted \svc{redis-1}, and Sentinel turned it into a replica of \svc{redis-2}.
+
+\subsubsection*{P3: Restore the database from a backup}
+
+This simulates recovering from a mistake: we took a backup with 3 reviews, published a
+fourth one and restored the backup on the backup node.
+\begin{lstlisting}
+$ pcount                                       # 3
+$ bk /backup.sh
+backup ok: /backups/20261018-1456 (444014 bytes, source: db:5433)
+$ pcount                                       # 4, review published at 14:57:16
+$ docker exec backup sh /restore.sh 20261018-1456 app
+$ pcount                                       # 3
+$ ... psql -c "select id, author, created from comments" app
+  1 | test 1 | 14:45:51
+ 34 | test 2 | 14:46:53
+ 35 | test 3 | 14:53:03
+$ docker exec front1 docker service logs --raw lab1_core | grep 'POST /comment'
+... 14:53:03 "POST /comment HTTP/1.1" 302
+... 14:57:16 "POST /comment HTTP/1.1" 302      # the review that disappears
+\end{lstlisting}
+The logs and the notification mail in Mailpit show that the fourth review existed (14:57:16),
+and after the restore only the three reviews written before the backup are left, so the
+database went back exactly to the moment of the backup. The tables keep their owner, so the
+application kept working on the restored data and, once its caches expired (about 40~s),
+the page showed only those three reviews. The jump from id 1 to 34 is not a lost review:
+after the failover of P1 PostgreSQL skips the ids that the old leader had reserved.
 
 \section{Results}
 
 \subsection{Local environment}
 
-The stack is started with \texttt{docker compose pull} and \texttt{docker compose up -d},
-and the 29 containers become healthy in under a minute (Moodle takes around three minutes
-on the first run because of its installation). The application works end to end: a new
-review is stored in PostgreSQL, shown on the page, sends a mail visible in Mailpit and
-updates the Grafana dashboards. When the PostgreSQL leader is stopped, another node takes
-over in about 3~s (about 28~s if the container is killed), and stopping the Redis master
-promotes its replica. In both cases reviews are still accepted and none are lost. Backups
-are encrypted, and the automatic restore test recovers the reviews and the 494 Moodle tables.
+The stack is started with \texttt{docker compose pull} and \texttt{docker compose up -d}
+and its 29 containers become healthy in a few minutes (Moodle is the slowest, because it
+installs itself on the first run). In the tests, the loss of the PostgreSQL leader was
+solved by Patroni in about 30~s and the loss of the Redis master by Sentinel in about
+12~s; in both cases the page kept working and no review was lost. The backup is encrypted
+and the restore test recovers the reviews and the 494 Moodle tables. The application
+scales to three replicas and the traffic is shared among them without touching nginx.
 
 \subsection{Production environment (\texttt{production.yml})}
 \label{sec:verified}
 
 Production runs the same stack on seven nodes, simulated on a single computer with
 Docker-in-Docker containers (\texttt{scripts/sim-swarm.sh}), three of them acting as swarm
-managers. Every service reaches its replica count and is placed on the node given by its
-label. The tests gave the following results:
+managers. After the deployment the 7 nodes were \emph{Ready} and the 34 services had all
+their replicas. The tests gave the following results:
 \begin{itemize}
-\item The three sites answer on port 443 through both front nodes (self-signed
-certificate), port 80 redirects, and traffic is balanced across front1/front2 and app1/app2.
-\item When app2 is shut down, swarm detects it in 13~s and a database replica is promoted.
-The page stays up and reviews are accepted again after the election. When the node comes
-back, its database rejoins as a replica automatically.
-\item If one front node fails, the other one serves all the sites.
-\item A rolling update of the frontend, with a request every 0.5~s, finished with no
-failed requests.
-\item Review mails appear in \texttt{http://mail.localhost:8080}, courses created in Atenea
-are stored, and both Prometheus replicas see all their targets up.
-\item Backups are taken from a database replica on the backup node, encrypted, and pass
-the restore test.
+\item When the node \texttt{app2} is switched off, the site stays up through the other
+application node, a new database leader is elected in about 30~s and new reviews are saved
+again. When the node comes back, its services return by themselves.
+\item When the Redis master is killed, the three Sentinels promote the replica in about
+7~s and the old master returns as a replica.
+\item A backup taken on the backup node, from a database replica, brings the application
+database back to the moment it was taken, and the application keeps working on it.
 \end{itemize}
 
 \section{Limitations}
